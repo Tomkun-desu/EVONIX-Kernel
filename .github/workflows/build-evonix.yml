@@ -110,9 +110,20 @@ jobs:
           echo "KernelSU-Next tip: $KSU_TIP"
           echo "ksu_sha=$KSU_TIP" >> "$GITHUB_OUTPUT"
           for i in 1 2 3; do
-            git -C KernelSU-Next fetch --depth=1 "$KSU_URL" "$KSU_TIP" && break || { [ "$i" -eq 3 ] && exit 1; sleep 10; }
+            # Kbuild (kernel/Kbuild) derives version as 30000 + rev-list --count
+            # of merge-base(HEAD, origin/dev) and tag via describe --tags: a
+            # depth-1 detached SHA has count=1 (=> 30001) and no tags (=> empty
+            # tag). Fetch branch refs + tags with full history and check out
+            # the branch so abbrev-ref/merge-base/describe resolve correctly.
+            git -C KernelSU-Next fetch --unshallow --tags "$KSU_URL" \
+              "+refs/heads/dev-susfs:refs/remotes/origin/dev-susfs" \
+              "+refs/heads/dev:refs/remotes/origin/dev" \
+            || git -C KernelSU-Next fetch --tags "$KSU_URL" \
+              "+refs/heads/dev-susfs:refs/remotes/origin/dev-susfs" \
+              "+refs/heads/dev:refs/remotes/origin/dev" \
+            && break || { [ "$i" -eq 3 ] && exit 1; sleep 10; }
           done
-          git -C KernelSU-Next checkout --detach "$KSU_TIP"
+          git -C KernelSU-Next checkout -B dev-susfs "$KSU_TIP"
           [ "$(git -C KernelSU-Next rev-parse HEAD)" = "$KSU_TIP" ] || { echo "KernelSU-Next pin mismatch" >&2; exit 1; }
           test -d drivers/kernelsu
 
@@ -122,8 +133,9 @@ jobs:
         run: |
           set -euo pipefail
           # Optional Droidspaces-OSS support (same source the GKI reference
-          # uses when DS is on): SYSVIPC kABI fix for GKI below 6.12 + 9 IPC
-          # configs. Default OFF — push builds never take this path.
+          # uses when DS is on): SYSVIPC kABI fix for GKI below 6.12 + IPC
+          # configs. Default OFF — push builds never take this path, and
+          # evonix.config stays untouched (configs live ONLY in this step).
           # (Same resolve-then-verify pattern as KernelSU-Next above.)
           DS_COMMIT="$(git ls-remote https://github.com/ravindu644/Droidspaces-OSS.git refs/heads/main | awk '{print $1; exit}')"
           [[ "$DS_COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "ERROR: could not resolve Droidspaces-OSS tip" >&2; exit 1; }
@@ -137,13 +149,16 @@ jobs:
           # SYSVIPC kABI fix for android15-6.6 (same patch file the GKI
           # reference applies for this version; dry-run verified on our tree).
           patch -p1 -d "$WORK_DIR/common" < "$RUNNER_TEMP/Droidspaces-OSS/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch"
-          # Droidspaces kernel configs (same 9 symbols as the reference
-          # actions/droidspaces Enable Kernel Configs step).
+          # Droidspaces kernel configs, applied ephemerally here only (same 9
+          # symbols as the reference actions/droidspaces Enable Kernel Configs
+          # step; evonix.config itself is NOT touched). USER_NS stays off.
           DS_CONFIG="$WORK_DIR/common/arch/arm64/configs/evonix.config"
-          for CFG in CONFIG_PID_NS CONFIG_SYSVIPC CONFIG_POSIX_MQUEUE CONFIG_IPC_NS CONFIG_DEVTMPFS CONFIG_BINFMT_MISC CONFIG_BINFMT_SCRIPT CONFIG_BINFMT_ELF CONFIG_USER_NS; do
+          for CFG in CONFIG_PID_NS CONFIG_SYSVIPC CONFIG_POSIX_MQUEUE CONFIG_IPC_NS CONFIG_DEVTMPFS CONFIG_BINFMT_MISC CONFIG_BINFMT_SCRIPT CONFIG_BINFMT_ELF; do
             sed -i "/^# $CFG is not set$/d" "$DS_CONFIG"
             grep -qx "$CFG=y" "$DS_CONFIG" || echo "$CFG=y" >> "$DS_CONFIG"
           done
+          sed -i '/^CONFIG_USER_NS=y$/d' "$DS_CONFIG"
+          grep -qx '# CONFIG_USER_NS is not set' "$DS_CONFIG" || echo '# CONFIG_USER_NS is not set' >> "$DS_CONFIG"
 
       - name: Restore Bazel cache
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.use_cache }}

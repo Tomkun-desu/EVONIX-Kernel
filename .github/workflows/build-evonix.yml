@@ -39,6 +39,8 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 180
+    outputs:
+      ksu_sha: ${{ steps.ksu-latest.outputs.ksu_sha }}
     steps:
       - name: Checkout current branch (+ submodules)
         uses: actions/checkout@v4
@@ -86,12 +88,25 @@ jobs:
           rm -rf "$WORK_DIR/common"
           cp -a "$SRC_DIR" "$WORK_DIR/common"
 
-      - name: Init KernelSU-Next submodule (pinned commit)
+      - name: Init KernelSU-Next submodule (latest upstream)
+        id: ksu-latest
         run: |
           set -euo pipefail
           cd "$WORK_DIR/common"
           git submodule update --init --recursive
           git ls-tree HEAD KernelSU-Next
+          # Unpinned: resolve the tip of the EVONIX-tracked KSU branch and
+          # check it out, so every build uses the latest KernelSU-Next.
+          # (Same resolve-then-verify pattern as AnyKernel3 packaging below.)
+          KSU_TIP="$(git ls-remote https://github.com/NEESCHAL-3/KernelSU-Next.git refs/heads/evonix-susfs-v3.4.0 | awk '{print $1; exit}')"
+          [[ "$KSU_TIP" =~ ^[0-9a-f]{40}$ ]] || { echo "ERROR: could not resolve KernelSU-Next tip" >&2; exit 1; }
+          echo "KernelSU-Next tip: $KSU_TIP"
+          echo "ksu_sha=$KSU_TIP" >> "$GITHUB_OUTPUT"
+          for i in 1 2 3; do
+            git -C KernelSU-Next fetch --depth=1 origin "$KSU_TIP" && break || { [ "$i" -eq 3 ] && exit 1; sleep 10; }
+          done
+          git -C KernelSU-Next checkout --detach "$KSU_TIP"
+          [ "$(git -C KernelSU-Next rev-parse HEAD)" = "$KSU_TIP" ] || { echo "KernelSU-Next pin mismatch" >&2; exit 1; }
           test -d drivers/kernelsu
 
       - name: Restore Bazel cache
@@ -207,7 +222,10 @@ jobs:
           shopt -s nullglob
           BRANCH="${{ github.ref_name }}"
           COMMIT="${{ github.sha }}"
-          KSU_PIN="$(git ls-tree HEAD KernelSU-Next | awk '{print $3}')"
+          # KSU SHA comes from the build job output (submodule is unpinned at
+          # build time); fallback to live tip resolve if the output is empty.
+          KSU_PIN="${{ needs.build.outputs.ksu_sha }}"
+          [ -n "$KSU_PIN" ] || KSU_PIN="$(git ls-remote https://github.com/NEESCHAL-3/KernelSU-Next.git refs/heads/evonix-susfs-v3.4.0 | awk '{print $1; exit}')"
           SUSFS_VER="$(grep -m1 '#define SUSFS_VERSION' include/linux/susfs.h | awk -F'"' '{print $2}')"
           KEXTRA="$(grep -m1 '^EXTRAVERSION' Makefile | awk '{print $3}')"
           mapfile -t TAGS < <(gh api --paginate "repos/${{ github.repository }}/tags?per_page=100" --jq '.[].name' 2>/dev/null | grep -E '^evonix-v[0-9]+$' || true)
@@ -223,7 +241,7 @@ jobs:
           - Branch: $BRANCH
           - Commit: $COMMIT
           - Kernel: 6.6.x ($KEXTRA)
-          - KernelSU-Next pin: $KSU_PIN
+          - KernelSU-Next: $KSU_PIN (latest evonix-susfs-v3.4.0)
           - SUSFS: $SUSFS_VER (in-tree)
           - Toolchain: Clang 23.0.1 (android build 16311247, r614150) + ThinLTO + AutoFDO
           - Device: Poco X7 Pro (rodin)

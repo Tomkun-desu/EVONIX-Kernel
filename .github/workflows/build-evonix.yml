@@ -287,10 +287,10 @@ jobs:
           BASE="${ZIP_NAME%.zip}"
           echo "ARTIFACT_NAME=$BASE" >> "$GITHUB_ENV"
           rm -rf AnyKernel3
-          AK3_COMMIT="$(git ls-remote https://github.com/WildKernels/AnyKernel3.git refs/heads/gki-2.0 | awk '{print $1; exit}')"
-          [ -n "$AK3_COMMIT" ] || { echo "ERROR: could not resolve AnyKernel3 gki-2.0 tip" >&2; exit 1; }
+          AK3_COMMIT="$(git ls-remote https://github.com/osm0sis/AnyKernel3.git refs/heads/master | awk '{print $1; exit}')"
+          [ -n "$AK3_COMMIT" ] || { echo "ERROR: could not resolve AnyKernel3 master tip" >&2; exit 1; }
           echo "AK3_COMMIT=$AK3_COMMIT" >> "$GITHUB_ENV"
-          for i in 1 2 3 4 5; do git clone https://github.com/WildKernels/AnyKernel3.git -b gki-2.0 AnyKernel3 && break || sleep 5; done
+          for i in 1 2 3 4 5; do git clone https://github.com/osm0sis/AnyKernel3.git -b master AnyKernel3 && break || sleep 5; done
           [ -d AnyKernel3/.git ] || { echo "ERROR: AnyKernel3 clone failed" >&2; exit 1; }
           git -C AnyKernel3 fetch --depth=1 origin "$AK3_COMMIT"
           git -C AnyKernel3 checkout "$AK3_COMMIT"
@@ -300,15 +300,71 @@ jobs:
           # magiskboot handle compression at repack; Image.lz4 would be wrong).
           cp -a "$DIST_DIR/Image" AnyKernel3/Image
           test -s AnyKernel3/Image
-          # EVONIX branding only. Device check stays OFF (upstream default
-          # do.devicecheck=0) so the zip also flashes on custom ROMs where
-          # ro.product.device differs from stock 'rodin'. Slot/ramdisk/
-          # vbmeta flags stay at AK3 auto defaults (A/B slots, stock
-          # ramdisk, no modules).
+          # EVONIX branding + OSM port. The osm0sis master template is a
+          # tuna-era sample (devicecheck on, omap BLOCK, slot detection off,
+          # dump_boot plus tuna ramdisk edits), so normalize it here to the
+          # EVONIX GKI layout: device check OFF via manual override below
+          # (not an upstream default) so the zip also flashes on custom ROMs
+          # where ro.product.device differs from stock rodin; BLOCK boot with
+          # auto slot handling, stock ramdisk flow, vbmeta auto, no modules.
+          # Pre-checks below fail hard if the upstream template drifts.
           sed -i 's|^kernel.string=.*|kernel.string=EVONIX '"${VARIANT}"' 6.6.'"${KVER}"' by Tomkun-desu @ '"${SHORT_SHA}"'|' AnyKernel3/anykernel.sh
-          # EVONIX flash-time banner: overwrites upstream WildKernels 'W' logo.
-          # update-binary prints 'banner' via ui_printfile, then kernel.string,
-          # so this file is the flash-time logo (plain ASCII, 44 cols).
+          # --- OSM port: normalize the tuna template to the EVONIX GKI layout.
+          # Pre-checks below fail the step under set -e if upstream drifts. ---
+          grep -qx 'do.devicecheck=1' AnyKernel3/anykernel.sh
+          grep -qx 'do.systemless=1' AnyKernel3/anykernel.sh
+          grep -qx 'device.name1=maguro' AnyKernel3/anykernel.sh
+          grep -qx 'device.name2=toro' AnyKernel3/anykernel.sh
+          grep -qx 'device.name3=toroplus' AnyKernel3/anykernel.sh
+          grep -qx 'device.name4=tuna' AnyKernel3/anykernel.sh
+          grep -qx 'device.name5=' AnyKernel3/anykernel.sh
+          grep -qx 'BLOCK=/dev/block/platform/omap/omap_hsmmc.0/by-name/boot;' AnyKernel3/anykernel.sh
+          grep -qx 'IS_SLOT_DEVICE=0;' AnyKernel3/anykernel.sh
+          grep -qx 'PATCH_VBMETA_FLAG=auto;' AnyKernel3/anykernel.sh
+          grep -qx 'dump_boot; # use split_boot to skip ramdisk unpack, e.g. for devices with init_boot ramdisk' AnyKernel3/anykernel.sh
+          grep -qx '# boot install' AnyKernel3/anykernel.sh
+          grep -qx '## end boot install' AnyKernel3/anykernel.sh
+          sed -i 's/^do\.devicecheck=.*/do.devicecheck=0/' AnyKernel3/anykernel.sh
+          sed -i 's/^do\.systemless=.*/do.systemless=0/' AnyKernel3/anykernel.sh
+          sed -i -E 's/^(device\.name[0-9]*)=.*/\1=/' AnyKernel3/anykernel.sh
+          sed -i 's|^BLOCK=.*|BLOCK=boot;|' AnyKernel3/anykernel.sh
+          sed -i 's|^IS_SLOT_DEVICE=.*|IS_SLOT_DEVICE=auto;|' AnyKernel3/anykernel.sh
+          grep -qx 'NO_MAGISK_CHECK=1;' AnyKernel3/anykernel.sh && { echo "ERROR: unexpected upstream NO_MAGISK_CHECK" >&2; exit 1; }
+          sed -i '/^PATCH_VBMETA_FLAG=auto;$/a NO_MAGISK_CHECK=1;' AnyKernel3/anykernel.sh
+          sed -i '/^boot_attributes() {$/,/^} # end attributes$/d' AnyKernel3/anykernel.sh
+          printf '%s\n' \
+            '# boot install' \
+            '' \
+            '# GKI kernel version check (KernelSU supports 5.10/5.15/6.1/6.6/6.12)' \
+            "kernel_version=\$(cat /proc/version | awk -F '-' '{print \$1}' | awk '{print \$3}')" \
+            'case $kernel_version in' \
+            '    5.10*|5.15*|6.1*|6.6*|6.12*) ksu_supported=true ;;' \
+            '    *) ksu_supported=false ;;' \
+            'esac' \
+            '' \
+            "ui_print \" \" \"  -> EVONIX Supported: \$ksu_supported\"" \
+            "\$ksu_supported || abort \"  -> Non-GKI device, abort.\"" \
+            '' \
+            'split_boot' \
+            '' \
+            "if [ -f \"\$SPLITIMG/ramdisk.cpio\" ]; then" \
+            '    unpack_ramdisk' \
+            '    write_boot' \
+            'else' \
+            '    flash_boot' \
+            'fi' \
+            '## end boot install' \
+            > "$RUNNER_TEMP/evonix-gki-section.txt"
+          awk -v SECTION="$RUNNER_TEMP/evonix-gki-section.txt" '
+            /^# boot install$/ { while ((getline LINE < SECTION) > 0) print LINE; SKIP=1; next }
+            SKIP { if (/^## end boot install$/) SKIP=0; next }
+            { print }
+          ' AnyKernel3/anykernel.sh > AnyKernel3/anykernel.sh.new
+          mv AnyKernel3/anykernel.sh.new AnyKernel3/anykernel.sh
+          # EVONIX flash-time banner: upstream osm0sis ships no banner file,
+          # so create ours here. update-binary prints 'banner' via
+          # ui_printfile, then kernel.string, so this file is the
+          # flash-time logo (plain ASCII, 44 cols).
           printf '%s\n' \
             '+==========================================+' \
             '|                                          |' \
@@ -319,10 +375,18 @@ jobs:
             '|    All rights belong to Mr. NEESCHAL     |' \
             '+==========================================+' \
             > AnyKernel3/banner
-          grep -qx 'do.devicecheck=0' AnyKernel3/anykernel.sh || echo "WARNING: AK3 upstream default changed: do.devicecheck" >&2
-          for KEY in 'do.modules=0' 'block=boot' 'is_slot_device=auto'; do
-            grep -qx "$KEY" AnyKernel3/anykernel.sh || echo "WARNING: AK3 upstream default changed/missing: $KEY" >&2
-          done
+          # OSM port guards: fail hard on any drift from the EVONIX GKI layout.
+          grep -qx 'do.devicecheck=0' AnyKernel3/anykernel.sh
+          grep -qx 'do.systemless=0' AnyKernel3/anykernel.sh
+          grep -qx 'do.modules=0' AnyKernel3/anykernel.sh
+          grep -qx 'BLOCK=boot;' AnyKernel3/anykernel.sh
+          grep -qx 'IS_SLOT_DEVICE=auto;' AnyKernel3/anykernel.sh
+          grep -qx 'NO_MAGISK_CHECK=1;' AnyKernel3/anykernel.sh
+          grep -qx 'split_boot' AnyKernel3/anykernel.sh
+          grep -qF '5.10*|5.15*|6.1*|6.6*|6.12*' AnyKernel3/anykernel.sh
+          if grep -q 'init\.tuna\|fstab\.tuna\|maguro\|toro\|tuna\|device\.name[0-9]*=[^[:space:]]' AnyKernel3/anykernel.sh; then echo "ERROR: tuna template remnant in anykernel.sh" >&2; exit 1; fi
+          if grep -q '^dump_boot' AnyKernel3/anykernel.sh; then echo "ERROR: dump_boot remnant in anykernel.sh" >&2; exit 1; fi
+          if grep -q '^boot_attributes' AnyKernel3/anykernel.sh; then echo "ERROR: boot_attributes remnant in anykernel.sh" >&2; exit 1; fi
           # Direct-flashable staging: the artifact itself IS the flashable tree.
           # upload-artifact re-zips `path`, so STAGE holds the AK3 layout at
           # top level (META-INF/anykernel.sh/Image/banner) plus the BuildInfo
@@ -364,7 +428,7 @@ jobs:
           - SUSFS: $SUSFS_VER (in-tree include/linux/susfs.h)
           - Droidspaces: $DS_STATUS
           - NoMount: $NM_STATUS
-          - AnyKernel3: $AK3_COMMIT (gki-2.0 @ WildKernels/AnyKernel3)
+          - AnyKernel3: $AK3_COMMIT (master @ osm0sis/AnyKernel3)
           - Toolchain: Clang 23.0.1 (android build 16311247, r614150) + ThinLTO + AutoFDO
           - Build date: $BUILD_DATE
           - Inputs: release_type=$IN_REL, use_cache=$IN_CACHE, use_ds=$IN_DS, use_nomount=$IN_NM

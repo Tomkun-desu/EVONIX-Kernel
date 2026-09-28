@@ -304,6 +304,19 @@ jobs:
           # vbmeta flags stay at AK3 auto defaults (A/B slots, stock
           # ramdisk, no modules).
           sed -i 's|^kernel.string=.*|kernel.string=EVONIX '"${VARIANT}"' 6.6.'"${KVER}"' by Tomkun-desu @ '"${SHORT_SHA}"'|' AnyKernel3/anykernel.sh
+          # EVONIX flash-time banner: overwrites upstream WildKernels 'W' logo.
+          # update-binary prints 'banner' via ui_printfile, then kernel.string,
+          # so this file is the flash-time logo (plain ASCII, 44 cols).
+          printf '%s\n' \
+            '+==========================================+' \
+            '|                                          |' \
+            '|               E V O N I X                |' \
+            '|              by Tomkun-desu              |' \
+            '|                                          |' \
+            '|------------------------------------------|' \
+            '|    All rights belong to Mr. NEESCHAL     |' \
+            '+==========================================+' \
+            > AnyKernel3/banner
           grep -qx 'do.devicecheck=0' AnyKernel3/anykernel.sh || echo "WARNING: AK3 upstream default changed: do.devicecheck" >&2
           for KEY in 'do.modules=0' 'block=boot' 'is_slot_device=auto'; do
             grep -qx "$KEY" AnyKernel3/anykernel.sh || echo "WARNING: AK3 upstream default changed/missing: $KEY" >&2
@@ -316,11 +329,27 @@ jobs:
           shopt -s nullglob
           ZIPS=(flashable/EVONIX-*.zip)
           [ "${#ZIPS[@]}" -eq 1 ] || { echo "ERROR: expected 1 flashable zip, found ${#ZIPS[@]}" >&2; ls -la flashable/ >&2; exit 1; }
+          # Direct-flashable Action artifact: upload-artifact always re-zips
+          # `path`, so uploading flashable/ double-wraps the inner versioned
+          # zip. The evonix-flashable artifact instead uploads AnyKernel3/
+          # raw — its downloaded zip then has AK3 layout at top level and
+          # flashes directly. Inner versioned zip in flashable/ is kept for
+          # the Release job via evonix-release-payload.
+          test -f AnyKernel3/anykernel.sh
+          test -f AnyKernel3/Image
+          test -d AnyKernel3/META-INF
 
-      - name: Upload flashable zip
+      - name: Upload flashable zip (direct-flashable)
         uses: actions/upload-artifact@v4
         with:
           name: evonix-flashable
+          path: ${{ github.workspace }}/AnyKernel3/
+          if-no-files-found: error
+
+      - name: Upload release payload (versioned zip + sha256)
+        uses: actions/upload-artifact@v4
+        with:
+          name: evonix-release-payload
           path: ${{ github.workspace }}/flashable/
           if-no-files-found: error
 
@@ -340,7 +369,7 @@ jobs:
       - name: Download flashable zip
         uses: actions/download-artifact@v4
         with:
-          name: evonix-flashable
+          name: evonix-release-payload
           path: flashable
 
       - name: Create GitHub release (auto tag evonix-vN)

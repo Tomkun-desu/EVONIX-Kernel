@@ -167,7 +167,7 @@ jobs:
               ''|'#'*) continue ;;
               '# CONFIG_'*' is not set')
                 SYM="${LINE#'# '}"; SYM="${SYM%' is not set'}"
-                sed -i "/^${SYM}=y$/d" "$DS_CONFIG"
+                sed -i "/^${SYM}=y$/d; /^${SYM}=n$/d" "$DS_CONFIG"
                 grep -qx "$LINE" "$DS_CONFIG" || echo "$LINE" >> "$DS_CONFIG"
                 ;;
               CONFIG_*'=y')

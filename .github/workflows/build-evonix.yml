@@ -1,0 +1,202 @@
+name: EVONIX Kernel Build
+
+# Kleaf (Bazel) build of the current branch. Branch-agnostic: works identically
+# on coloros/ksu-susfs and hyperos/ksu-susfs — the branch itself selects the
+# EXTRAVERSION (COS vs HOS) and defconfig fragment.
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_type:
+        description: "Release type"
+        type: choice
+        options:
+          - Action
+          - Pre-Release
+          - Release
+        default: Action
+      use_cache:
+        description: "Restore/save Bazel cache"
+        type: boolean
+        default: true
+  push:
+    branches:
+      - coloros/ksu-susfs
+      - hyperos/ksu-susfs
+    paths-ignore:
+      - "**/*.md"
+      - "Documentation/**"
+
+env:
+  SRC_DIR: ${{ github.workspace }}/src
+  WORK_DIR: ${{ github.workspace }}/evonix-workspace
+  DIST_DIR: ${{ github.workspace }}/dist
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Checkout current branch (+ submodules)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 1
+          submodules: recursive
+          path: src
+
+      - name: Free disk space
+        uses: endersonmenezes/free-disk-space@v3
+        with:
+          remove_android: true
+          remove_dotnet: true
+          remove_haskell: true
+          remove_tool_cache: true
+          remove_swap: true
+          remove_packages: "azure-cli google-cloud-cli microsoft-edge-stable google-chrome-stable firefox postgresql* temurin-* *llvm* mysql* dotnet-sdk-*"
+          remove_packages_one_command: true
+          remove_folders: "/usr/share/swift /usr/share/miniconda /usr/share/az* /usr/local/lib/node_modules /usr/local/share/chromium /usr/local/share/powershell /usr/local/julia /usr/local/aws-cli /usr/local/aws-sam-cli /usr/share/gradle"
+          testing: false
+
+      - name: Add 16 GB swap (ThinLTO)
+        uses: pierotofy/set-swap-space@master
+        with:
+          swap-size-gb: 16
+
+      - name: Set up repo-manifest workspace (per BUILDING.md)
+        run: |
+          set -euo pipefail
+          git config --global safe.directory '*'
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq git-core curl rsync python3
+          mkdir -p "$HOME/bin"
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo > "$HOME/bin/repo"
+          chmod a+x "$HOME/bin/repo"
+          export PATH="$HOME/bin:$PATH"
+          mkdir -p "$WORK_DIR"
+          cd "$WORK_DIR"
+          repo init -u https://android.googlesource.com/kernel/manifest \
+            -b common-android15-6.6-lts --depth=1
+          repo sync -c -j"$(nproc)"
+          # This repo IS the common/ project: replace the manifest's common/
+          # with the checked-out EVONIX source (keeps EVONIX .git history).
+          rm -rf "$WORK_DIR/common"
+          cp -a "$SRC_DIR" "$WORK_DIR/common"
+
+      - name: Init KernelSU-Next submodule (pinned commit)
+        run: |
+          set -euo pipefail
+          cd "$WORK_DIR/common"
+          git submodule update --init --recursive
+          git ls-tree HEAD KernelSU-Next
+          test -d drivers/kernelsu
+
+      - name: Restore Bazel cache
+        if: ${{ inputs.use_cache != false }}
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/bazel
+          key: evonix-bazel-${{ github.ref_name }}-${{ hashFiles('src/Makefile', 'src/BUILD.bazel', 'src/build.config.constants', 'src/arch/arm64/configs/evonix.config') }}
+          restore-keys: |
+            evonix-bazel-${{ github.ref_name }}-
+
+      - name: Set up Clang 23 toolchain
+        run: |
+          set -euo pipefail
+          EVONIX_WORKSPACE="$WORK_DIR" bash "$WORK_DIR/common/setup-clang23.sh"
+
+      - name: Build via build-evonix.sh
+        run: |
+          set -euo pipefail
+          bash "$WORK_DIR/common/build-evonix.sh" "$DIST_DIR"
+
+      - name: Verify Image + vmlinux
+        run: |
+          set -euo pipefail
+          test -s "$DIST_DIR/Image"
+          test -s "$DIST_DIR/vmlinux"
+          ls -la "$DIST_DIR"
+          sha256sum "$DIST_DIR/Image" | tee "$DIST_DIR/Image.sha256"
+
+      - name: Upload dist artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: evonix-dist
+          path: ${{ github.workspace }}/dist/
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: github.event_name == 'workflow_dispatch' && (inputs.release_type == 'Release' || inputs.release_type == 'Pre-Release')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout (build metadata)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 1
+
+      - name: Download dist artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: evonix-dist
+          path: dist
+
+      - name: Create GitHub release (auto tag evonix-vN)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          BRANCH="${{ github.ref_name }}"
+          COMMIT="${{ github.sha }}"
+          KSU_PIN="$(git ls-tree HEAD KernelSU-Next | awk '{print $3}')"
+          SUSFS_VER="$(grep -m1 '#define SUSFS_VERSION' include/linux/susfs.h | awk -F'"' '{print $2}')"
+          KEXTRA="$(grep -m1 '^EXTRAVERSION' Makefile | awk '{print $3}')"
+          mapfile -t TAGS < <(gh api --paginate "repos/${{ github.repository }}/tags?per_page=100" --jq '.[].name' 2>/dev/null | grep -E '^evonix-v[0-9]+$' || true)
+          MAX=0
+          for T in ${TAGS[@]:-}; do
+            N="${T#evonix-v}"
+            if [[ "$N" =~ ^[0-9]+$ && "$N" -gt "$MAX" ]]; then MAX="$N"; fi
+          done
+          TAG="evonix-v$((MAX + 1))"
+          echo "Tag: $TAG (branch $BRANCH @ ${COMMIT:0:12})"
+          cat > "dist/BuildInfo-$TAG.md" <<EOF
+          # EVONIX $TAG
+          - Branch: $BRANCH
+          - Commit: $COMMIT
+          - Kernel: 6.6.x ($KEXTRA)
+          - KernelSU-Next pin: $KSU_PIN
+          - SUSFS: $SUSFS_VER (in-tree)
+          - Toolchain: Clang 23.0.1 (android build 16311247, r614150) + ThinLTO + AutoFDO
+          - Device: Poco X7 Pro (rodin)
+          EOF
+          CREATE_ARGS=(--title "EVONIX $TAG ($BRANCH)" --notes-file "dist/BuildInfo-$TAG.md")
+          if [ "${{ inputs.release_type }}" = "Pre-Release" ]; then CREATE_ARGS+=(--prerelease); fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --notes-file "dist/BuildInfo-$TAG.md"
+          else
+            gh release create "$TAG" "${CREATE_ARGS[@]}"
+          fi
+          # Sequential uploads with retries (bulk upload got runners OOM-killed).
+          FILES=(dist/Image dist/BuildInfo-"$TAG".md)
+          for OPT in dist/Image.lz4 dist/boot.img dist/kernel_sbom.spdx.json; do
+            [ -f "$OPT" ] && FILES+=("$OPT")
+          done
+          for KO in dist/*.ko; do FILES+=("$KO"); done
+          FAILED=0
+          for F in "${FILES[@]}"; do
+            OK=false
+            for ATTEMPT in 1 2 3; do
+              if gh release upload "$TAG" "$F" --clobber; then OK=true; break; fi
+              echo "Attempt $ATTEMPT/3 failed for: $F" >&2
+              sleep 10
+            done
+            [ "$OK" = true ] || FAILED=1
+          done
+          exit "$FAILED"

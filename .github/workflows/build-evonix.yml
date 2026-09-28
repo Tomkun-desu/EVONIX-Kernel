@@ -128,6 +128,47 @@ jobs:
           path: ${{ github.workspace }}/dist/
           if-no-files-found: error
 
+      - name: Package AnyKernel3 flashable zip
+        run: |
+          set -euo pipefail
+          case "${{ github.ref_name }}" in
+            coloros/*) VARIANT="COS" ;;
+            hyperos/*) VARIANT="HOS" ;;
+            *) echo "Unknown branch: ${{ github.ref_name }}" >&2; exit 1 ;;
+          esac
+          KVER="$(grep -m1 '^SUBLEVEL' src/Makefile | awk '{print $3}')"
+          SHORT_SHA="${GITHUB_SHA:0:12}"
+          ZIP_NAME="EVONIX-${VARIANT}-6.6.${KVER}-${SHORT_SHA}.zip"
+          echo "ZIP_NAME=$ZIP_NAME" >> "$GITHUB_ENV"
+          rm -rf AnyKernel3 && git clone --depth 1 --branch gki-2.0 \
+            https://github.com/WildKernels/AnyKernel3.git AnyKernel3
+          rm -rf AnyKernel3/.git
+          # Raw uncompressed Image only (GKI/AK3 convention: ak3-core +
+          # magiskboot handle compression at repack; Image.lz4 would be wrong).
+          cp -a "$DIST_DIR/Image" AnyKernel3/Image
+          test -s AnyKernel3/Image
+          # EVONIX branding + rodin device guard; slot/ramdisk/vbmeta flags
+          # stay at AK3 auto defaults (A/B slots, stock ramdisk, no modules).
+          sed -i 's|^kernel.string=.*|kernel.string=EVONIX '"${VARIANT}"' 6.6.'"${KVER}"' by Tomkun-desu @ '"${SHORT_SHA}"'|' AnyKernel3/anykernel.sh
+          sed -i 's|^do.devicecheck=.*|do.devicecheck=1|' AnyKernel3/anykernel.sh
+          sed -i 's|^device.name1=.*|device.name1=rodin|' AnyKernel3/anykernel.sh
+          grep -qx 'do.devicecheck=1' AnyKernel3/anykernel.sh
+          grep -qx 'device.name1=rodin' AnyKernel3/anykernel.sh
+          grep -qx 'do.modules=0' AnyKernel3/anykernel.sh
+          grep -qx 'block=boot' AnyKernel3/anykernel.sh
+          grep -qx 'is_slot_device=auto' AnyKernel3/anykernel.sh
+          ( cd AnyKernel3 && zip -r -q -9 "../$ZIP_NAME" . )
+          mkdir -p flashable && mv "$ZIP_NAME" flashable/
+          sha256sum "flashable/$ZIP_NAME" | tee "$DIST_DIR/$ZIP_NAME.sha256"
+          unzip -l "flashable/$ZIP_NAME"
+
+      - name: Upload flashable zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: evonix-flashable
+          path: ${{ github.workspace }}/flashable/
+          if-no-files-found: error
+
   release:
     needs: build
     if: github.event_name == 'workflow_dispatch' && (inputs.release_type == 'Release' || inputs.release_type == 'Pre-Release')
@@ -146,6 +187,12 @@ jobs:
         with:
           name: evonix-dist
           path: dist
+
+      - name: Download flashable zip
+        uses: actions/download-artifact@v4
+        with:
+          name: evonix-flashable
+          path: flashable
 
       - name: Create GitHub release (auto tag evonix-vN)
         env:
@@ -185,6 +232,7 @@ jobs:
           fi
           # Sequential uploads with retries (bulk upload got runners OOM-killed).
           FILES=(dist/Image dist/BuildInfo-"$TAG".md)
+          for Z in flashable/EVONIX-*.zip; do FILES+=("$Z"); done
           for OPT in dist/Image.lz4 dist/boot.img dist/kernel_sbom.spdx.json; do
             [ -f "$OPT" ] && FILES+=("$OPT")
           done

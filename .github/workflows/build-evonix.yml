@@ -22,6 +22,10 @@ on:
         description: "Restore/save Bazel cache"
         type: boolean
         default: true
+      use_ds:
+        description: "Droidspaces-OSS (SYSVIPC kABI fix + IPC configs)"
+        type: boolean
+        default: false
   push:
     branches:
       - coloros/ksu-susfs
@@ -41,6 +45,7 @@ jobs:
     timeout-minutes: 180
     outputs:
       ksu_sha: ${{ steps.ksu-latest.outputs.ksu_sha }}
+      ds_commit: ${{ steps.ds.outputs.ds_commit }}
     steps:
       - name: Checkout current branch (+ submodules)
         uses: actions/checkout@v4
@@ -110,6 +115,35 @@ jobs:
           git -C KernelSU-Next checkout --detach "$KSU_TIP"
           [ "$(git -C KernelSU-Next rev-parse HEAD)" = "$KSU_TIP" ] || { echo "KernelSU-Next pin mismatch" >&2; exit 1; }
           test -d drivers/kernelsu
+
+      - name: Apply Droidspaces-OSS (optional, dispatch only)
+        id: ds
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.use_ds }}
+        run: |
+          set -euo pipefail
+          # Optional Droidspaces-OSS support (same source the GKI reference
+          # uses when DS is on): SYSVIPC kABI fix for GKI below 6.12 + 9 IPC
+          # configs. Default OFF — push builds never take this path.
+          # (Same resolve-then-verify pattern as KernelSU-Next above.)
+          DS_COMMIT="$(git ls-remote https://github.com/ravindu644/Droidspaces-OSS.git refs/heads/main | awk '{print $1; exit}')"
+          [[ "$DS_COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "ERROR: could not resolve Droidspaces-OSS tip" >&2; exit 1; }
+          echo "Droidspaces-OSS tip: $DS_COMMIT"
+          echo "ds_commit=$DS_COMMIT" >> "$GITHUB_OUTPUT"
+          for i in 1 2 3 4 5; do git clone --depth=1 https://github.com/ravindu644/Droidspaces-OSS.git "$RUNNER_TEMP/Droidspaces-OSS" && break || sleep 5; done
+          [ -d "$RUNNER_TEMP/Droidspaces-OSS/.git" ] || { echo "ERROR: Droidspaces-OSS clone failed" >&2; exit 1; }
+          git -C "$RUNNER_TEMP/Droidspaces-OSS" fetch --depth=1 origin "$DS_COMMIT"
+          git -C "$RUNNER_TEMP/Droidspaces-OSS" checkout "$DS_COMMIT"
+          [ "$(git -C "$RUNNER_TEMP/Droidspaces-OSS" rev-parse HEAD)" = "$DS_COMMIT" ] || { echo "Droidspaces pin mismatch" >&2; exit 1; }
+          # SYSVIPC kABI fix for android15-6.6 (same patch file the GKI
+          # reference applies for this version; dry-run verified on our tree).
+          patch -p1 -d "$WORK_DIR/common" < "$RUNNER_TEMP/Droidspaces-OSS/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch"
+          # Droidspaces kernel configs (same 9 symbols as the reference
+          # actions/droidspaces Enable Kernel Configs step).
+          DS_CONFIG="$WORK_DIR/common/arch/arm64/configs/evonix.config"
+          for CFG in CONFIG_PID_NS CONFIG_SYSVIPC CONFIG_POSIX_MQUEUE CONFIG_IPC_NS CONFIG_DEVTMPFS CONFIG_BINFMT_MISC CONFIG_BINFMT_SCRIPT CONFIG_BINFMT_ELF CONFIG_USER_NS; do
+            sed -i "/^# $CFG is not set$/d" "$DS_CONFIG"
+            grep -qx "$CFG=y" "$DS_CONFIG" || echo "$CFG=y" >> "$DS_CONFIG"
+          done
 
       - name: Restore Bazel cache
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.use_cache }}
@@ -228,6 +262,12 @@ jobs:
           # build time); fallback to live tip resolve if the output is empty.
           KSU_PIN="${{ needs.build.outputs.ksu_sha }}"
           [ -n "$KSU_PIN" ] || KSU_PIN="$(git ls-remote https://github.com/pershoot/KernelSU-Next.git refs/heads/dev-susfs | awk '{print $1; exit}')"
+          DS_PIN="${{ needs.build.outputs.ds_commit }}"
+          DS_STATUS="disabled"
+          if [ "${{ inputs.use_ds }}" = "true" ]; then
+            [ -n "$DS_PIN" ] || DS_PIN="$(git ls-remote https://github.com/ravindu644/Droidspaces-OSS.git refs/heads/main | awk '{print $1; exit}')"
+            DS_STATUS="enabled ($DS_PIN)"
+          fi
           SUSFS_VER="$(grep -m1 '#define SUSFS_VERSION' include/linux/susfs.h | awk -F'"' '{print $2}')"
           KEXTRA="$(grep -m1 '^EXTRAVERSION' Makefile | awk '{print $3}')"
           mapfile -t TAGS < <(gh api --paginate "repos/${{ github.repository }}/tags?per_page=100" --jq '.[].name' 2>/dev/null | grep -E '^evonix-v[0-9]+$' || true)
@@ -245,6 +285,7 @@ jobs:
           - Kernel: 6.6.x ($KEXTRA)
           - KernelSU-Next: $KSU_PIN (latest dev-susfs @ pershoot/KernelSU-Next)
           - SUSFS: $SUSFS_VER (in-tree)
+          - Droidspaces: $DS_STATUS
           - Toolchain: Clang 23.0.1 (android build 16311247, r614150) + ThinLTO + AutoFDO
           - Device: Poco X7 Pro (rodin)
           EOF

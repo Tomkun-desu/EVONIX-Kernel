@@ -281,9 +281,11 @@ jobs:
             *) echo "Unknown branch: ${{ github.ref_name }}" >&2; exit 1 ;;
           esac
           KVER="$(grep -m1 '^SUBLEVEL' src/Makefile | awk '{print $3}')"
+          KEXTRA="$(grep -m1 '^EXTRAVERSION' src/Makefile | awk '{print $3}')"
           SHORT_SHA="${GITHUB_SHA:0:12}"
           ZIP_NAME="EVONIX-${VARIANT}-6.6.${KVER}-${SHORT_SHA}.zip"
-          echo "ZIP_NAME=$ZIP_NAME" >> "$GITHUB_ENV"
+          BASE="${ZIP_NAME%.zip}"
+          echo "ARTIFACT_NAME=$BASE" >> "$GITHUB_ENV"
           rm -rf AnyKernel3
           AK3_COMMIT="$(git ls-remote https://github.com/WildKernels/AnyKernel3.git refs/heads/gki-2.0 | awk '{print $1; exit}')"
           [ -n "$AK3_COMMIT" ] || { echo "ERROR: could not resolve AnyKernel3 gki-2.0 tip" >&2; exit 1; }
@@ -321,37 +323,90 @@ jobs:
           for KEY in 'do.modules=0' 'block=boot' 'is_slot_device=auto'; do
             grep -qx "$KEY" AnyKernel3/anykernel.sh || echo "WARNING: AK3 upstream default changed/missing: $KEY" >&2
           done
-          rm -f "$ZIP_NAME"
-          ( cd AnyKernel3 && zip -r -q -9 "../$ZIP_NAME" . )
-          mkdir -p flashable && mv "$ZIP_NAME" flashable/
-          ( cd flashable && sha256sum "$ZIP_NAME" | tee "$ZIP_NAME.sha256" )
-          unzip -l "flashable/$ZIP_NAME"
-          shopt -s nullglob
-          ZIPS=(flashable/EVONIX-*.zip)
-          [ "${#ZIPS[@]}" -eq 1 ] || { echo "ERROR: expected 1 flashable zip, found ${#ZIPS[@]}" >&2; ls -la flashable/ >&2; exit 1; }
-          # Direct-flashable Action artifact: upload-artifact always re-zips
-          # `path`, so uploading flashable/ double-wraps the inner versioned
-          # zip. The evonix-flashable artifact instead uploads AnyKernel3/
-          # raw — its downloaded zip then has AK3 layout at top level and
-          # flashes directly. Inner versioned zip in flashable/ is kept for
-          # the Release job via evonix-release-payload.
+          # Direct-flashable staging: the artifact itself IS the flashable tree.
+          # upload-artifact re-zips `path`, so STAGE holds the AK3 layout at
+          # top level (META-INF/anykernel.sh/Image/banner) plus the BuildInfo
+          # manifest + Image.sha256. No inner versioned zip — the downloaded
+          # <ARTIFACT_NAME>.zip flashes directly with no extraction step.
+          # AK3 layout guards on the source dir.
           test -f AnyKernel3/anykernel.sh
           test -f AnyKernel3/Image
           test -d AnyKernel3/META-INF
+          test -f AnyKernel3/banner
+          IMG_SIZE="$(stat -c%s AnyKernel3/Image)"
+          IMG_SHA="$(sha256sum AnyKernel3/Image | cut -d' ' -f1)"
+          KSU_PIN="${{ steps.ksu-latest.outputs.ksu_sha }}"
+          DS_PIN="${{ steps.ds.outputs.ds_commit }}"
+          NM_PIN="${{ steps.nm.outputs.nm_commit }}"
+          DS_STATUS="disabled"; [ -n "$DS_PIN" ] || DS_PIN="n/a"
+          if [ "${DS_PIN}" != "n/a" ]; then DS_STATUS="enabled ($DS_PIN)"; fi
+          NM_STATUS="disabled"; [ -n "$NM_PIN" ] || NM_PIN="n/a"
+          if [ "${NM_PIN}" != "n/a" ]; then NM_STATUS="enabled ($NM_PIN)"; fi
+          SUSFS_VER="$(grep -m1 '#define SUSFS_VERSION' src/include/linux/susfs.h 2>/dev/null | awk -F'"' '{print $2}')"
+          [ -n "$SUSFS_VER" ] || SUSFS_VER="unknown"
+          KSTRING="$(grep -m1 '^kernel.string=' AnyKernel3/anykernel.sh | cut -d= -f2-)"
+          BUILD_DATE="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          # inputs.* is empty on push — default gracefully.
+          IN_REL="${{ inputs.release_type }}"; IN_REL="${IN_REL:-Action (push)}"
+          IN_CACHE="${{ inputs.use_cache }}"; IN_CACHE="${IN_CACHE:-true}"
+          IN_DS="${{ inputs.use_ds }}"; IN_DS="${IN_DS:-false}"
+          IN_NM="${{ inputs.use_nomount }}"; IN_NM="${IN_NM:-false}"
+          STAGE="evonix-artifact"
+          rm -rf "$STAGE"; mkdir -p "$STAGE"
+          cp -a AnyKernel3/. "$STAGE/"
+          ( cd "$STAGE" && sha256sum Image > Image.sha256 )
+          cat > "$STAGE/BuildInfo-$BASE.md" <<EOF
+          # EVONIX BuildInfo — $BASE
+          - Branch: ${{ github.ref_name }}
+          - Commit: $GITHUB_SHA (short: $SHORT_SHA)
+          - Kernel: 6.6.$KVER ($KEXTRA)
+          - KernelSU-Next: $KSU_PIN (dev-susfs @ pershoot/KernelSU-Next)
+          - SUSFS: $SUSFS_VER (in-tree include/linux/susfs.h)
+          - Droidspaces: $DS_STATUS
+          - NoMount: $NM_STATUS
+          - AnyKernel3: $AK3_COMMIT (gki-2.0 @ WildKernels/AnyKernel3)
+          - Toolchain: Clang 23.0.1 (android build 16311247, r614150) + ThinLTO + AutoFDO
+          - Build date: $BUILD_DATE
+          - Inputs: release_type=$IN_REL, use_cache=$IN_CACHE, use_ds=$IN_DS, use_nomount=$IN_NM
+          - kernel.string: $KSTRING
+          - Image: $IMG_SIZE bytes, sha256 $IMG_SHA
+          - Artifact: $BASE.zip (direct-flashable — AK3 top level + this BuildInfo, no inner zip)
+          EOF
+          # Throwaway re-zip proves the staged tree zips cleanly; log entries.
+          rm -f "_verify_$BASE.zip"
+          ( cd "$STAGE" && zip -r -q -9 "../_verify_$BASE.zip" . )
+          ZIP_LIST="$(unzip -l "_verify_$BASE.zip")"
+          echo "$ZIP_LIST"
+          for ENTRY in 'META-INF/' 'anykernel.sh' 'Image' 'banner' "BuildInfo-$BASE.md" 'Image.sha256'; do
+            grep -q "$ENTRY" <<<"$ZIP_LIST" || { echo "ERROR: staged artifact missing entry: $ENTRY" >&2; exit 1; }
+          done
+          rm -f "_verify_$BASE.zip"
+          # Bilingual build summary: config matrix → artifact result.
+          {
+            echo "## EVONIX Build — $BASE"
+            echo ""
+            echo "رویداد / Event: ${{ github.event_name }} | شاخه / Branch: ${{ github.ref_name }}"
+            echo ""
+            echo "| inputs (use_ds/use_nomount/use_cache/release_type) | نتیجه / Result |"
+            echo "|---|---|"
+            echo "| $IN_DS / $IN_NM / $IN_CACHE / $IN_REL | 🗜️ $BASE.zip — مستقیم‌فلش / direct-flashable, Image $IMG_SIZE bytes, sha256 \`${IMG_SHA:0:16}…\` |"
+            echo ""
+            echo "| Pin | مقدار / Value |"
+            echo "|---|---|"
+            echo "| KSU-Next | \`${KSU_PIN:-n/a}\` |"
+            echo "| SUSFS | \`$SUSFS_VER\` |"
+            echo "| Droidspaces | \`$DS_STATUS\` |"
+            echo "| NoMount | \`$NM_STATUS\` |"
+            echo "| AnyKernel3 | \`${AK3_COMMIT:-n/a}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload flashable zip (direct-flashable)
+      - name: Upload EVONIX artifact (zip + sha256 + BuildInfo)
         uses: actions/upload-artifact@v4
         with:
-          name: evonix-flashable
-          path: ${{ github.workspace }}/AnyKernel3/
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ github.workspace }}/evonix-artifact/
           if-no-files-found: error
-
-      - name: Upload release payload (versioned zip + sha256)
-        uses: actions/upload-artifact@v4
-        with:
-          name: evonix-release-payload
-          path: ${{ github.workspace }}/flashable/
-          if-no-files-found: error
+          compression-level: 0
 
   release:
     needs: build
@@ -366,11 +421,12 @@ jobs:
           ref: ${{ github.ref }}
           fetch-depth: 1
 
-      - name: Download flashable zip
+      - name: Download EVONIX artifact (zip + sha256 + BuildInfo)
         uses: actions/download-artifact@v4
         with:
-          name: evonix-release-payload
-          path: flashable
+          pattern: EVONIX-*
+          path: evonix-artifact
+          merge-multiple: true
 
       - name: Create GitHub release (auto tag evonix-vN)
         env:
@@ -425,13 +481,23 @@ jobs:
           else
             gh release create "$TAG" "${CREATE_ARGS[@]}"
           fi
-          # Release ships the flashable zip + its sha256 + BuildInfo only.
-          # (Raw dist/ is no longer uploaded as an artifact.)
-          FILES=(BuildInfo-"$TAG".md)
-          for Z in flashable/EVONIX-*; do FILES+=("$Z"); done
-          N_ZIPS=0
-          for F in "${FILES[@]}"; do case "$F" in flashable/EVONIX-*.zip) N_ZIPS=$((N_ZIPS+1));; esac; done
-          [ "$N_ZIPS" -ge 1 ] || { echo "ERROR: no EVONIX flashable zip collected for release" >&2; ls -la flashable/ >&2; exit 1; }
+          # The artifact payload is the raw AK3 tree (direct-flashable, no
+          # inner zip). Re-zip it here into the versioned release zip.
+          ls -la evonix-artifact/
+          INFOS=(evonix-artifact/BuildInfo-*.md)
+          [ "${#INFOS[@]}" -eq 1 ] || { echo "ERROR: expected 1 BuildInfo in artifact, found ${#INFOS[@]}" >&2; exit 1; }
+          BASE="$(basename "${INFOS[0]}" .md)"; BASE="${BASE#BuildInfo-}"
+          ZIP_NAME="$BASE.zip"
+          test -f evonix-artifact/anykernel.sh
+          test -f evonix-artifact/Image
+          test -d evonix-artifact/META-INF
+          rm -f "$ZIP_NAME" "$ZIP_NAME.sha256"
+          ( cd evonix-artifact && zip -r -q -9 "../$ZIP_NAME" . )
+          sha256sum "$ZIP_NAME" | tee "$ZIP_NAME.sha256"
+          unzip -l "$ZIP_NAME"
+          # Release ships the versioned flashable zip + its sha256 + both
+          # BuildInfo manifests (tag notes + in-artifact manifest).
+          FILES=(BuildInfo-"$TAG".md "$ZIP_NAME" "$ZIP_NAME.sha256" "${INFOS[0]}")
           FAILED=0
           for F in "${FILES[@]}"; do
             OK=false

@@ -26,6 +26,10 @@ on:
         description: "Droidspaces-OSS (SYSVIPC kABI fix + IPC configs)"
         type: boolean
         default: false
+      use_nomount:
+        description: "NoMount VFS hooks + CONFIG_NOMOUNT"
+        type: boolean
+        default: false
   push:
     branches:
       - coloros/ksu-susfs
@@ -46,6 +50,7 @@ jobs:
     outputs:
       ksu_sha: ${{ steps.ksu-latest.outputs.ksu_sha }}
       ds_commit: ${{ steps.ds.outputs.ds_commit }}
+      nm_commit: ${{ steps.nm.outputs.nm_commit }}
     steps:
       - name: Checkout current branch (+ submodules)
         uses: actions/checkout@v4
@@ -134,8 +139,9 @@ jobs:
           set -euo pipefail
           # Optional Droidspaces-OSS support (same source the GKI reference
           # uses when DS is on): SYSVIPC kABI fix for GKI below 6.12 + IPC
-          # configs. Default OFF — push builds never take this path, and
-          # evonix.config stays untouched (configs live ONLY in this step).
+          # configs from arch/arm64/configs/evonix-ds.config. Default OFF —
+          # push builds never take this path, and evonix.config itself is
+          # NOT touched (fragment is applied ephemerally on the runner copy).
           # (Same resolve-then-verify pattern as KernelSU-Next above.)
           DS_COMMIT="$(git ls-remote https://github.com/ravindu644/Droidspaces-OSS.git refs/heads/main | awk '{print $1; exit}')"
           [[ "$DS_COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "ERROR: could not resolve Droidspaces-OSS tip" >&2; exit 1; }
@@ -149,16 +155,88 @@ jobs:
           # SYSVIPC kABI fix for android15-6.6 (same patch file the GKI
           # reference applies for this version; dry-run verified on our tree).
           patch -p1 -d "$WORK_DIR/common" < "$RUNNER_TEMP/Droidspaces-OSS/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch"
-          # Droidspaces kernel configs, applied ephemerally here only (same 9
-          # symbols as the reference actions/droidspaces Enable Kernel Configs
-          # step; evonix.config itself is NOT touched). USER_NS stays off.
+          # Droidspaces kernel configs from the committed fragment
+          # arch/arm64/configs/evonix-ds.config (visible/auditable; same 9
+          # symbols as the reference Enable Kernel Configs step, USER_NS off).
+          # Applied ephemerally on the runner copy; evonix.config untouched.
           DS_CONFIG="$WORK_DIR/common/arch/arm64/configs/evonix.config"
-          for CFG in CONFIG_PID_NS CONFIG_SYSVIPC CONFIG_POSIX_MQUEUE CONFIG_IPC_NS CONFIG_DEVTMPFS CONFIG_BINFMT_MISC CONFIG_BINFMT_SCRIPT CONFIG_BINFMT_ELF; do
-            sed -i "/^# $CFG is not set$/d" "$DS_CONFIG"
-            grep -qx "$CFG=y" "$DS_CONFIG" || echo "$CFG=y" >> "$DS_CONFIG"
-          done
-          sed -i '/^CONFIG_USER_NS=y$/d' "$DS_CONFIG"
-          grep -qx '# CONFIG_USER_NS is not set' "$DS_CONFIG" || echo '# CONFIG_USER_NS is not set' >> "$DS_CONFIG"
+          DS_FRAG="$WORK_DIR/common/arch/arm64/configs/evonix-ds.config"
+          test -s "$DS_FRAG"
+          while IFS= read -r LINE || [ -n "$LINE" ]; do
+            case "$LINE" in
+              ''|'#'*) continue ;;
+              '# CONFIG_'*' is not set')
+                SYM="${LINE#'# '}"; SYM="${SYM%' is not set'}"
+                sed -i "/^${SYM}=y$/d" "$DS_CONFIG"
+                grep -qx "$LINE" "$DS_CONFIG" || echo "$LINE" >> "$DS_CONFIG"
+                ;;
+              CONFIG_*'=y')
+                SYM="${LINE%'=y'}"
+                sed -i "/^# ${SYM} is not set$/d; /^${SYM}=n$/d" "$DS_CONFIG"
+                grep -qx "$LINE" "$DS_CONFIG" || echo "$LINE" >> "$DS_CONFIG"
+                ;;
+              CONFIG_*'=n')
+                SYM="${LINE%'=n'}"
+                sed -i "/^# ${SYM} is not set$/d; /^${SYM}=y$/d" "$DS_CONFIG"
+                grep -qx "$LINE" "$DS_CONFIG" || echo "$LINE" >> "$DS_CONFIG"
+                ;;
+              *) echo "ERROR: unexpected line in evonix-ds.config: $LINE" >&2; exit 1 ;;
+            esac
+          done < "$DS_FRAG"
+
+      - name: Apply NoMount (optional, dispatch only)
+        id: nm
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.use_nomount }}
+        run: |
+          set -euo pipefail
+          # Optional NoMount VFS hooks (same source the GKI reference uses):
+          # kernel/setup.sh wires fs/nomount symlink + fs/Makefile + fs/Kconfig,
+          # configs from arch/arm64/configs/evonix-nm.config. Default OFF —
+          # push builds never take this path, and the git tree stays clean
+          # (integration happens on the runner workspace copy only).
+          # (Same resolve-then-verify pattern as KernelSU-Next above.)
+          NM_COMMIT="$(git ls-remote https://github.com/maxsteeel/nomount.git refs/heads/dev | awk '{print $1; exit}')"
+          [[ "$NM_COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "ERROR: could not resolve NoMount tip" >&2; exit 1; }
+          echo "NoMount tip: $NM_COMMIT"
+          echo "nm_commit=$NM_COMMIT" >> "$GITHUB_OUTPUT"
+          NM_SETUP="$RUNNER_TEMP/nomount-setup-$NM_COMMIT.sh"
+          curl --fail --location --silent --show-error --retry 5 --retry-delay 5 --retry-all-errors \
+            "https://raw.githubusercontent.com/maxsteeel/nomount/${NM_COMMIT}/kernel/setup.sh" \
+            --output "$NM_SETUP"
+          test -s "$NM_SETUP"
+          chmod 0755 "$NM_SETUP"
+          # Pre-clone at the exact SHA: upstream rewinds dev often, so a fresh
+          # clone may no longer contain the pinned tree. (Same as reference.)
+          if [ ! -d "$WORK_DIR/common/NoMount" ]; then
+            git clone --no-checkout https://github.com/maxsteeel/nomount.git "$WORK_DIR/common/NoMount"
+          fi
+          git -C "$WORK_DIR/common/NoMount" fetch --depth=1 origin "$NM_COMMIT"
+          git -C "$WORK_DIR/common/NoMount" checkout --detach --quiet "$NM_COMMIT"
+          ( cd "$WORK_DIR/common" && "$NM_SETUP" "$NM_COMMIT" )
+          [ "$(git -C "$WORK_DIR/common/NoMount" rev-parse HEAD)" = "$NM_COMMIT" ] || { echo "NoMount pin mismatch" >&2; exit 1; }
+          test -L "$WORK_DIR/common/fs/nomount" || { echo "ERROR: fs/nomount symlink missing" >&2; exit 1; }
+          # NoMount kernel configs from the committed fragment
+          # arch/arm64/configs/evonix-nm.config (visible/auditable).
+          # Applied ephemerally on the runner copy; evonix.config untouched.
+          NM_CONFIG="$WORK_DIR/common/arch/arm64/configs/evonix.config"
+          NM_FRAG="$WORK_DIR/common/arch/arm64/configs/evonix-nm.config"
+          test -s "$NM_FRAG"
+          while IFS= read -r LINE || [ -n "$LINE" ]; do
+            case "$LINE" in
+              ''|'#'*) continue ;;
+              '# CONFIG_'*' is not set')
+                SYM="${LINE#'# '}"; SYM="${SYM%' is not set'}"
+                sed -i "/^${SYM}=y$/d" "$NM_CONFIG"
+                grep -qx "$LINE" "$NM_CONFIG" || echo "$LINE" >> "$NM_CONFIG"
+                ;;
+              CONFIG_*'=y')
+                SYM="${LINE%'=y'}"
+                sed -i "/^# ${SYM} is not set$/d" "$NM_CONFIG"
+                grep -qx "$LINE" "$NM_CONFIG" || echo "$LINE" >> "$NM_CONFIG"
+                ;;
+              *) echo "ERROR: unexpected line in evonix-nm.config: $LINE" >&2; exit 1 ;;
+            esac
+          done < "$NM_FRAG"
 
       - name: Restore Bazel cache
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.use_cache }}
@@ -283,6 +361,12 @@ jobs:
             [ -n "$DS_PIN" ] || DS_PIN="$(git ls-remote https://github.com/ravindu644/Droidspaces-OSS.git refs/heads/main | awk '{print $1; exit}')"
             DS_STATUS="enabled ($DS_PIN)"
           fi
+          NM_PIN="${{ needs.build.outputs.nm_commit }}"
+          NM_STATUS="disabled"
+          if [ "${{ inputs.use_nomount }}" = "true" ]; then
+            [ -n "$NM_PIN" ] || NM_PIN="$(git ls-remote https://github.com/maxsteeel/nomount.git refs/heads/dev | awk '{print $1; exit}')"
+            NM_STATUS="enabled ($NM_PIN)"
+          fi
           SUSFS_VER="$(grep -m1 '#define SUSFS_VERSION' include/linux/susfs.h | awk -F'"' '{print $2}')"
           KEXTRA="$(grep -m1 '^EXTRAVERSION' Makefile | awk '{print $3}')"
           mapfile -t TAGS < <(gh api --paginate "repos/${{ github.repository }}/tags?per_page=100" --jq '.[].name' 2>/dev/null | grep -E '^evonix-v[0-9]+$' || true)
@@ -301,6 +385,7 @@ jobs:
           - KernelSU-Next: $KSU_PIN (latest dev-susfs @ pershoot/KernelSU-Next)
           - SUSFS: $SUSFS_VER (in-tree)
           - Droidspaces: $DS_STATUS
+          - NoMount: $NM_STATUS
           - Toolchain: Clang 23.0.1 (android build 16311247, r614150) + ThinLTO + AutoFDO
           - Device: Poco X7 Pro (rodin)
           EOF

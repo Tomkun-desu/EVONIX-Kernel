@@ -401,16 +401,16 @@ jobs:
           # EVONIX flash-time banner: upstream osm0sis ships no banner file,
           # so create ours here. update-binary prints 'banner' via
           # ui_printfile, then kernel.string, so this file is the
-          # flash-time logo (plain ASCII, 44 cols).
+          # flash-time logo (plain ASCII, 38 cols).
           printf '%s\n' \
-            '+==========================================+' \
-            '|                                          |' \
-            '|               E V O N I X                |' \
-            '|              by Tomkun-desu              |' \
-            '|                                          |' \
-            '|------------------------------------------|' \
-            '|    All rights belong to Mr. NEESCHAL     |' \
-            '+==========================================+' \
+            '+====================================+' \
+            '|                                    |' \
+            '|            E V O N I X             |' \
+            '|           by Tomkun-desu           |' \
+            '|                                    |' \
+            '|------------------------------------|' \
+            '|  All rights belong to Mr. NEESCHAL |' \
+            '+====================================+' \
             > AnyKernel3/banner
           # OSM port guards: fail hard on any drift from the EVONIX GKI layout.
           grep -qx 'do.devicecheck=0' AnyKernel3/anykernel.sh

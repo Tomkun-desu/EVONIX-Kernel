@@ -242,7 +242,10 @@ jobs:
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.use_cache }}
         uses: actions/cache@v4
         with:
-          path: ~/.cache/bazel
+          # Real Bazel output root: build-evonix.sh locates the generated
+          # .config under $WORKSPACE/out/bazel/output_user_root and never
+          # passes --output_base, so ~/.cache/bazel is never written.
+          path: ${{ env.WORK_DIR }}/out/bazel/output_user_root
           key: evonix-bazel-${{ github.ref_name }}-${{ hashFiles('src/Makefile', 'src/BUILD.bazel', 'src/build.config.constants', 'src/arch/arm64/configs/evonix.config') }}
           restore-keys: |
             evonix-bazel-${{ github.ref_name }}-
@@ -264,12 +267,22 @@ jobs:
           test -s "$DIST_DIR/vmlinux"
           ls -la "$DIST_DIR"
           sha256sum "$DIST_DIR/Image" | tee "$DIST_DIR/Image.sha256"
+          # BBR3 self-testimony: every build proves BBR3 was compiled in.
+          # Primary: CONFIG_TCP_CONG_BBR3=y in the generated final .config
+          # (same locate pattern as build-evonix.sh). Secondary: bbr3 symbol
+          # in System.map when the dist carries one.
+          BBR3_CFG="$(find "$WORK_DIR/out/bazel/output_user_root" -path '*kernel_aarch64_config/out_dir/.config' -type f -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n 1 | cut -d' ' -f2-)"
+          [ -n "$BBR3_CFG" ] || { echo "ERROR: final kernel .config not found" >&2; exit 1; }
+          grep -qx 'CONFIG_TCP_CONG_BBR3=y' "$BBR3_CFG" || { echo "ERROR: CONFIG_TCP_CONG_BBR3=y missing from final .config ($BBR3_CFG)" >&2; exit 1; }
+          grep -E '^CONFIG_TCP_CONG_BBR' "$BBR3_CFG" || true
+          if [ -f "$DIST_DIR/System.map" ]; then grep -q 'bbr3' "$DIST_DIR/System.map" || { echo "ERROR: no bbr3 symbol in System.map" >&2; exit 1; }; fi
 
       - name: Save Bazel cache
         if: ${{ always() && (github.event_name != 'workflow_dispatch' || inputs.use_cache) }}
         uses: actions/cache/save@v4
         with:
-          path: ~/.cache/bazel
+          # Same real Bazel output root as Restore (see comment there).
+          path: ${{ env.WORK_DIR }}/out/bazel/output_user_root
           key: evonix-bazel-${{ github.ref_name }}-${{ hashFiles('src/Makefile', 'src/BUILD.bazel', 'src/build.config.constants', 'src/arch/arm64/configs/evonix.config') }}
 
       - name: Package AnyKernel3 flashable zip
@@ -400,6 +413,10 @@ jobs:
           IMG_SIZE="$(stat -c%s AnyKernel3/Image)"
           IMG_SHA="$(sha256sum AnyKernel3/Image | cut -d' ' -f1)"
           KSU_PIN="${{ steps.ksu-latest.outputs.ksu_sha }}"
+          # KSU always runs (no `if:` on ksu-latest): an empty pin means the
+          # step failed to publish ksu_sha — fail hard, never ship unknown KSU.
+          # (DS/NM are optional/conditional: empty there is valid, handled below.)
+          [ -n "$KSU_PIN" ] || { echo "ERROR: KSU_PIN is empty (ksu_sha missing)" >&2; exit 1; }
           DS_PIN="${{ steps.ds.outputs.ds_commit }}"
           NM_PIN="${{ steps.nm.outputs.nm_commit }}"
           DS_STATUS="disabled"; [ -n "$DS_PIN" ] || DS_PIN="n/a"

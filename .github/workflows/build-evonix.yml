@@ -309,6 +309,30 @@ jobs:
           git -C AnyKernel3 checkout "$AK3_COMMIT"
           [ "$(git -C AnyKernel3 rev-parse HEAD)" = "$AK3_COMMIT" ] || { echo "AnyKernel3 pin mismatch" >&2; exit 1; }
           rm -rf AnyKernel3/.git
+          # AArch64 tools: master ships 32-bit ARM tools that OrangeFox on
+          # rodin cannot exec (Exec format error in setup_bb). Replace with
+          # OSM-native 64-bit tools from the arm64-tools branch (same author).
+          AK3_TOOLS_COMMIT="$(git ls-remote https://github.com/osm0sis/AnyKernel3.git refs/heads/arm64-tools | awk '{print $1; exit}')"
+          [ -n "$AK3_TOOLS_COMMIT" ] || { echo "ERROR: could not resolve AnyKernel3 arm64-tools tip" >&2; exit 1; }
+          echo "AK3_TOOLS_COMMIT=$AK3_TOOLS_COMMIT" >> "$GITHUB_ENV"
+          echo "AnyKernel3 arm64-tools tip: $AK3_TOOLS_COMMIT"
+          for i in 1 2 3 4 5; do rm -rf "$RUNNER_TEMP/ak3-arm64tools" && git clone --depth=1 -b arm64-tools https://github.com/osm0sis/AnyKernel3.git "$RUNNER_TEMP/ak3-arm64tools" && break || sleep 5; done
+          [ -d "$RUNNER_TEMP/ak3-arm64tools/.git" ] || { echo "ERROR: AnyKernel3 arm64-tools clone failed" >&2; exit 1; }
+          git -C "$RUNNER_TEMP/ak3-arm64tools" fetch --depth=1 origin "$AK3_TOOLS_COMMIT"
+          git -C "$RUNNER_TEMP/ak3-arm64tools" checkout "$AK3_TOOLS_COMMIT"
+          [ "$(git -C "$RUNNER_TEMP/ak3-arm64tools" rev-parse HEAD)" = "$AK3_TOOLS_COMMIT" ] || { echo "AnyKernel3 arm64-tools pin mismatch" >&2; exit 1; }
+          for T in busybox fec httools_static lptools_static magiskboot magiskpolicy snapshotupdater_static; do
+            test -s "$RUNNER_TEMP/ak3-arm64tools/$T" || { echo "ERROR: arm64-tools missing: $T" >&2; exit 1; }
+            cp -a "$RUNNER_TEMP/ak3-arm64tools/$T" AnyKernel3/tools/$T
+          done
+          chmod 755 AnyKernel3/tools/busybox AnyKernel3/tools/fec AnyKernel3/tools/httools_static AnyKernel3/tools/lptools_static AnyKernel3/tools/magiskboot AnyKernel3/tools/magiskpolicy AnyKernel3/tools/snapshotupdater_static
+          rm -rf "$RUNNER_TEMP/ak3-arm64tools"
+          # Fail-hard: tools must be AArch64 (e_machine 0xB7), else recovery
+          # dies in setup_bb with Exec format error.
+          for BIN in busybox fec httools_static lptools_static magiskboot magiskpolicy snapshotupdater_static; do
+            MACH="$(od -A n -t x1 -j 18 -N 2 "AnyKernel3/tools/$BIN" | tr -d ' \n')"
+            [ "$MACH" = "b700" ] || { echo "ERROR: AnyKernel3/tools/$BIN not AArch64 (e_machine=$MACH)" >&2; exit 1; }
+          done
           # Raw uncompressed Image only (GKI/AK3 convention: ak3-core +
           # magiskboot handle compression at repack; Image.lz4 would be wrong).
           cp -a "$DIST_DIR/Image" AnyKernel3/Image
@@ -446,6 +470,7 @@ jobs:
           - Droidspaces: $DS_STATUS
           - NoMount: $NM_STATUS
           - AnyKernel3: $AK3_COMMIT (master @ osm0sis/AnyKernel3)
+          - AnyKernel3 tools: $AK3_TOOLS_COMMIT (arm64-tools @ osm0sis/AnyKernel3, AArch64)
           - Toolchain: Clang 23.0.1 (android build 16311247, r614150) + ThinLTO + AutoFDO
           - Build date: $BUILD_DATE
           - Inputs: release_type=$IN_REL, use_cache=$IN_CACHE, use_ds=$IN_DS, use_nomount=$IN_NM

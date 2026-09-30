@@ -162,13 +162,22 @@ jobs:
           [[ "$SUSFS_TIP" =~ ^[0-9a-f]{40}$ ]] || { echo "ERROR: could not resolve SUSFS tip" >&2; exit 1; }
           echo "SUSFS tip: $SUSFS_TIP"
           echo "susfs_commit=$SUSFS_TIP" >> "$GITHUB_OUTPUT"
-          for i in 1 2 3 4 5; do git clone --depth=1 -b "$SUSFS_BRANCH" "$SUSFS_URL" "$RUNNER_TEMP/susfs4ksu" && break || sleep 5; done
+          for i in 1 2 3 4 5; do rm -rf "${RUNNER_TEMP:?}/susfs4ksu"; git clone --depth=1 -b "$SUSFS_BRANCH" "$SUSFS_URL" "$RUNNER_TEMP/susfs4ksu" && break || sleep 5; done
           [ -d "$RUNNER_TEMP/susfs4ksu/.git" ] || { echo "ERROR: susfs4ksu clone failed" >&2; exit 1; }
-          git -C "$RUNNER_TEMP/susfs4ksu" fetch --depth=1 origin "$SUSFS_TIP"
-          git -C "$RUNNER_TEMP/susfs4ksu" checkout "$SUSFS_TIP"
+          for i in 1 2 3; do git -C "$RUNNER_TEMP/susfs4ksu" fetch --depth=1 origin "$SUSFS_TIP" && git -C "$RUNNER_TEMP/susfs4ksu" checkout "$SUSFS_TIP" && break || { [ "$i" -eq 3 ] && exit 1; sleep 10; }; done
           [ "$(git -C "$RUNNER_TEMP/susfs4ksu" rev-parse HEAD)" = "$SUSFS_TIP" ] || { echo "SUSFS pin mismatch" >&2; exit 1; }
-          SUSFS_PATCH="50_add_susfs_in_gki-android15-6.6.patch"
+          # If upstream lands a commit between ls-remote and fetch, this build
+          # pins the resolved TIP (at most one commit behind) and warns; the
+          # pin is recorded in the susfs_commit output.
+          SUSFS_TIP2="$(git ls-remote "$SUSFS_URL" "refs/heads/$SUSFS_BRANCH" | awk '{print $1; exit}' || true)"
+          if [ -n "${SUSFS_TIP2:-}" ] && [ "$SUSFS_TIP2" != "$SUSFS_TIP" ]; then echo "WARNING: SUSFS tip moved during fetch ($SUSFS_TIP -> $SUSFS_TIP2); building pinned $SUSFS_TIP" >&2; fi
+          # Resolve the 50_add patch by glob (exactly one must match): survives
+          # an upstream rename, fails LOUD on zero/multiple matches.
+          SUSFS_PATCH_CANDIDATES=( "$RUNNER_TEMP"/susfs4ksu/kernel_patches/50_add_susfs_in_*.patch )
+          [ "${#SUSFS_PATCH_CANDIDATES[@]}" -eq 1 ] || { echo "ERROR: expected exactly one 50_add_susfs patch, found ${#SUSFS_PATCH_CANDIDATES[@]}" >&2; exit 1; }
+          SUSFS_PATCH="$(basename "${SUSFS_PATCH_CANDIDATES[0]}")"
           test -f "$RUNNER_TEMP/susfs4ksu/kernel_patches/$SUSFS_PATCH"
+          echo "SUSFS patch file: $SUSFS_PATCH"
           cp "$RUNNER_TEMP/susfs4ksu/kernel_patches/fs/"* "$WORK_DIR/common/fs/"
           cp "$RUNNER_TEMP/susfs4ksu/kernel_patches/include/linux/"* "$WORK_DIR/common/include/linux/"
           cp "$RUNNER_TEMP/susfs4ksu/kernel_patches/$SUSFS_PATCH" "$WORK_DIR/common/"

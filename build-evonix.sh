@@ -167,8 +167,11 @@ fi
 
 KERNEL_VERSION="$(strings "$DIST/Image" | grep -m1 'Linux version' || true)"
 
+echo "Banner:"
+echo "$KERNEL_VERSION"
+
 grep -q 'clang version 23\.0\.1' <<<"$KERNEL_VERSION" ||
-    die "Built Image does not report Clang 23.0.1."
+    die "Built Image does not report Clang 23.0.1. Banner was: [$KERNEL_VERSION]"
 
 grep -q 'r614150' <<<"$KERNEL_VERSION" ||
     die "Built Image does not report r614150."

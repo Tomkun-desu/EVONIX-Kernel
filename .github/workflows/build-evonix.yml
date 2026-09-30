@@ -30,6 +30,14 @@ on:
         description: "NoMount VFS hooks + CONFIG_NOMOUNT"
         type: boolean
         default: false
+      use_ntsync:
+        description: "NTSync driver (Wine/Proton sync primitives) + CONFIG_NTSYNC"
+        type: boolean
+        default: false
+      use_bbg:
+        description: "Baseband-Guard LSM + CONFIG_BBG (generic allowlist until rodin validated)"
+        type: boolean
+        default: false
   push:
     branches:
       - coloros/ksu-susfs
@@ -49,8 +57,13 @@ jobs:
     timeout-minutes: 180
     outputs:
       ksu_sha: ${{ steps.ksu-latest.outputs.ksu_sha }}
+      susfs_commit: ${{ steps.susfs.outputs.susfs_commit }}
+      susfs_ver: ${{ steps.susfs.outputs.susfs_ver }}
       ds_commit: ${{ steps.ds.outputs.ds_commit }}
       nm_commit: ${{ steps.nm.outputs.nm_commit }}
+      ntsync_commit: ${{ steps.ntsync.outputs.ntsync_commit }}
+      bbg_commit: ${{ steps.bbg.outputs.bbg_commit }}
+      bbg_allowlist: ${{ steps.bbg.outputs.bbg_allowlist }}
     steps:
       - name: Checkout current branch (+ submodules)
         uses: actions/checkout@v4
@@ -131,6 +144,74 @@ jobs:
           git -C KernelSU-Next checkout -B dev-susfs "$KSU_TIP"
           [ "$(git -C KernelSU-Next rev-parse HEAD)" = "$KSU_TIP" ] || { echo "KernelSU-Next pin mismatch" >&2; exit 1; }
           test -d drivers/kernelsu
+
+      - name: Apply SUSFS floating (tip of gki-android15-6.6)
+        id: susfs
+        run: |
+          set -euo pipefail
+          # Floating SUSFS (Wild-style, single-version): every build resolves
+          # the tip of gki-android15-6.6 fresh and applies it onto the runner
+          # copy. The git tree carries NO susfs sources and NO
+          # CONFIG_KSU_SUSFS* in evonix.config (both removed in the same
+          # commit that added this step); hooks come from 50_add, configs
+          # merge ephemerally here. KSU (dev-susfs fork) untouched.
+          # (Same resolve-then-verify pattern as KernelSU-Next above.)
+          SUSFS_URL="https://gitlab.com/simonpunk/susfs4ksu.git"
+          SUSFS_BRANCH="gki-android15-6.6"
+          SUSFS_TIP="$(git ls-remote "$SUSFS_URL" "refs/heads/$SUSFS_BRANCH" | awk '{print $1; exit}')"
+          [[ "$SUSFS_TIP" =~ ^[0-9a-f]{40}$ ]] || { echo "ERROR: could not resolve SUSFS tip" >&2; exit 1; }
+          echo "SUSFS tip: $SUSFS_TIP"
+          echo "susfs_commit=$SUSFS_TIP" >> "$GITHUB_OUTPUT"
+          for i in 1 2 3 4 5; do git clone --depth=1 -b "$SUSFS_BRANCH" "$SUSFS_URL" "$RUNNER_TEMP/susfs4ksu" && break || sleep 5; done
+          [ -d "$RUNNER_TEMP/susfs4ksu/.git" ] || { echo "ERROR: susfs4ksu clone failed" >&2; exit 1; }
+          git -C "$RUNNER_TEMP/susfs4ksu" fetch --depth=1 origin "$SUSFS_TIP"
+          git -C "$RUNNER_TEMP/susfs4ksu" checkout "$SUSFS_TIP"
+          [ "$(git -C "$RUNNER_TEMP/susfs4ksu" rev-parse HEAD)" = "$SUSFS_TIP" ] || { echo "SUSFS pin mismatch" >&2; exit 1; }
+          SUSFS_PATCH="50_add_susfs_in_gki-android15-6.6.patch"
+          test -f "$RUNNER_TEMP/susfs4ksu/kernel_patches/$SUSFS_PATCH"
+          cp "$RUNNER_TEMP/susfs4ksu/kernel_patches/fs/"* "$WORK_DIR/common/fs/"
+          cp "$RUNNER_TEMP/susfs4ksu/kernel_patches/include/linux/"* "$WORK_DIR/common/include/linux/"
+          cp "$RUNNER_TEMP/susfs4ksu/kernel_patches/$SUSFS_PATCH" "$WORK_DIR/common/"
+          SUSFS_VER="$(grep -m1 '#define SUSFS_VERSION' "$RUNNER_TEMP/susfs4ksu/kernel_patches/include/linux/susfs.h" | awk -F'"' '{print $2}')"
+          [ -n "$SUSFS_VER" ] || { echo "ERROR: SUSFS_VERSION not found" >&2; exit 1; }
+          echo "susfs_ver=$SUSFS_VER" >> "$GITHUB_OUTPUT"
+          # The git tree carries the hook blocks (kept); the runner copy must
+          # first be stripped back to the pre-image, then the fresh 50_add is
+          # applied. Strip = exact reverse of the same patch file (proved on
+          # scratch: reverse + forward round-trips byte-identical, modulo the
+          # vma rename below). No custom strip script — the patch is its own
+          # inverse, so a newer tip with a different patch fails LOUD here
+          # instead of silently mis-applying.
+          # Our tree carries Google's pgsize_migration backport (newer than the
+          # patch pre-image): normalize the renamed symbol before reverse,
+          # same as the reference fake-patch stage (single sed, 6.12-gated
+          # there, unconditional here since SUBLEVEL=142 always has it).
+          if grep -q 'vma_data_pages' "$WORK_DIR/common/fs/proc/task_mmu.c"; then
+            sed -i 's/vma_data_pages/vma_pages/g' "$WORK_DIR/common/fs/proc/task_mmu.c"
+          fi
+          git -C "$WORK_DIR/common" apply -R --check "./$SUSFS_PATCH" || exit 1
+          git -C "$WORK_DIR/common" apply -R "./$SUSFS_PATCH"
+          git -C "$WORK_DIR/common" apply --check "./$SUSFS_PATCH" || exit 1
+          git -C "$WORK_DIR/common" apply "./$SUSFS_PATCH"
+          # Restore our tree's pgsize_migration rename on the two pre-existing
+          # call sites only. Guarded to the exact stock context lines so a
+          # future floating patch that adds its own `if (vma_pages(vma))` is
+          # never rewritten: only lines the stock tree already has.
+          sed -i 's/^\tif (vma_pages(vma))$/\tif (vma_data_pages(vma))/; s/^\tif (!vma_pages(vma))$/\tif (!vma_data_pages(vma))/' "$WORK_DIR/common/fs/proc/task_mmu.c"
+          # VMA_PAD_START fallback (version-agnostic, no-op when the real
+          # header already provides it — same as the reference patches stage).
+          if grep -q 'VMA_PAD_START(' "$WORK_DIR/common/fs/proc/task_mmu.c" && ! grep -qE '#include <linux/pgsize_migration(_inline)?\.h>|define VMA_PAD_START' "$WORK_DIR/common/fs/proc/task_mmu.c"; then
+            sed -i '1a #ifndef VMA_PAD_START\n#define VMA_PAD_START(vma) ((vma)->vm_end)\n#endif' "$WORK_DIR/common/fs/proc/task_mmu.c"
+          fi
+          # SUSFS kernel configs merged ephemerally on the runner copy;
+          # evonix.config itself is NOT touched (keeps tree LOG choice).
+          SUSFS_CONFIG="$WORK_DIR/common/arch/arm64/configs/evonix.config"
+          for SYM in CONFIG_KSU_SUSFS CONFIG_KSU_SUSFS_SUS_PATH CONFIG_KSU_SUSFS_SUS_MOUNT CONFIG_KSU_SUSFS_SUS_KSTAT CONFIG_KSU_SUSFS_SPOOF_UNAME CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG CONFIG_KSU_SUSFS_OPEN_REDIRECT CONFIG_KSU_SUSFS_SUS_MAP; do
+            sed -i "/^# ${SYM} is not set$/d; /^${SYM}=n$/d" "$SUSFS_CONFIG"
+            grep -qx "${SYM}=y" "$SUSFS_CONFIG" || echo "${SYM}=y" >> "$SUSFS_CONFIG"
+          done
+          grep -q '^CONFIG_KSU_SUSFS=y$' "$SUSFS_CONFIG"
+          grep -q '^CONFIG_KSU_SUSFS_SUS_MAP=y$' "$SUSFS_CONFIG"
 
       - name: Apply Droidspaces-OSS (optional, dispatch only)
         id: ds
@@ -237,6 +318,155 @@ jobs:
               *) echo "ERROR: unexpected line in evonix-nm.config: $LINE" >&2; exit 1 ;;
             esac
           done < "$NM_FRAG"
+
+      - name: Apply NTSync (optional, dispatch only)
+        id: ntsync
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.use_ntsync }}
+        run: |
+          set -euo pipefail
+          # Optional NTSync driver (same source the kernel_patches reference
+          # ships for android15-6.6): base patch adds drivers/misc/ntsync.c +
+          # include/uapi/linux/ntsync.h, the android15-6.6 compat patch wires
+          # Kconfig (config NTSYNC) + Makefile. Configs come from the
+          # committed fragment arch/arm64/configs/evonix-ntsync.config.
+          # Default OFF — push builds never take this path, and the git tree
+          # stays clean (patches apply on the runner workspace copy only).
+          # (Same resolve-then-verify pattern as KernelSU-Next above.)
+          KP_COMMIT="$(git ls-remote https://github.com/WildKernels/kernel_patches.git refs/heads/main | awk '{print $1; exit}')"
+          [[ "$KP_COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "ERROR: could not resolve kernel_patches tip" >&2; exit 1; }
+          echo "kernel_patches tip: $KP_COMMIT"
+          echo "ntsync_commit=$KP_COMMIT" >> "$GITHUB_OUTPUT"
+          curl --fail --location --silent --show-error --retry 5 --retry-delay 5 --retry-all-errors \
+            "https://raw.githubusercontent.com/WildKernels/kernel_patches/${KP_COMMIT}/common/ntsync/ntsync_base.patch" \
+            --output "$RUNNER_TEMP/ntsync-base-$KP_COMMIT.patch"
+          curl --fail --location --silent --show-error --retry 5 --retry-delay 5 --retry-all-errors \
+            "https://raw.githubusercontent.com/WildKernels/kernel_patches/${KP_COMMIT}/common/ntsync/ntsync_compat_android15-6.6.patch" \
+            --output "$RUNNER_TEMP/ntsync-compat-$KP_COMMIT.patch"
+          test -s "$RUNNER_TEMP/ntsync-base-$KP_COMMIT.patch"
+          test -s "$RUNNER_TEMP/ntsync-compat-$KP_COMMIT.patch"
+          patch -p1 -d "$WORK_DIR/common" < "$RUNNER_TEMP/ntsync-base-$KP_COMMIT.patch"
+          patch -p1 -d "$WORK_DIR/common" < "$RUNNER_TEMP/ntsync-compat-$KP_COMMIT.patch"
+          # Fail-hard guards: driver sources + Kconfig/Makefile wiring.
+          test -s "$WORK_DIR/common/drivers/misc/ntsync.c" || { echo "ERROR: drivers/misc/ntsync.c missing after patch" >&2; exit 1; }
+          test -s "$WORK_DIR/common/include/uapi/linux/ntsync.h" || { echo "ERROR: include/uapi/linux/ntsync.h missing after patch" >&2; exit 1; }
+          grep -q '^config NTSYNC$' "$WORK_DIR/common/drivers/misc/Kconfig" || { echo "ERROR: config NTSYNC missing from drivers/misc/Kconfig" >&2; exit 1; }
+          grep -q 'obj-$(CONFIG_NTSYNC)' "$WORK_DIR/common/drivers/misc/Makefile" || { echo "ERROR: NTSYNC obj entry missing from drivers/misc/Makefile" >&2; exit 1; }
+          # NTSync kernel configs from the committed fragment
+          # arch/arm64/configs/evonix-ntsync.config (visible/auditable).
+          # Applied ephemerally on the runner copy; evonix.config untouched.
+          NTSYNC_CONFIG="$WORK_DIR/common/arch/arm64/configs/evonix.config"
+          NTSYNC_FRAG="$WORK_DIR/common/arch/arm64/configs/evonix-ntsync.config"
+          test -s "$NTSYNC_FRAG"
+          while IFS= read -r LINE || [ -n "$LINE" ]; do
+            case "$LINE" in
+              ''|'#'*) continue ;;
+              '# CONFIG_'*' is not set')
+                SYM="${LINE#'# '}"; SYM="${SYM%' is not set'}"
+                sed -i "/^${SYM}=y$/d" "$NTSYNC_CONFIG"
+                grep -qx "$LINE" "$NTSYNC_CONFIG" || echo "$LINE" >> "$NTSYNC_CONFIG"
+                ;;
+              CONFIG_*'=y')
+                SYM="${LINE%'=y'}"
+                sed -i "/^# ${SYM} is not set$/d" "$NTSYNC_CONFIG"
+                grep -qx "$LINE" "$NTSYNC_CONFIG" || echo "$LINE" >> "$NTSYNC_CONFIG"
+                ;;
+              *) echo "ERROR: unexpected line in evonix-ntsync.config: $LINE" >&2; exit 1 ;;
+            esac
+          done < "$NTSYNC_FRAG"
+
+      - name: Apply Baseband-Guard (optional, dispatch only)
+        id: bbg
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.use_bbg }}
+        run: |
+          set -euo pipefail
+          # Optional Baseband-Guard LSM (upstream vc-teahouse/Baseband-guard):
+          # kernel-side tree is cloned at a pinned SHA into
+          # $WORK_DIR/common/Baseband-guard and wired exactly like the
+          # upstream setup.sh cloud-compile path (security/baseband-guard
+          # symlink + security/Makefile obj entry + security/Kconfig source
+          # entry + CONFIG_LSM defaults extended with baseband_guard).
+          # Configs come from the committed fragment
+          # arch/arm64/configs/evonix-bbg.config (BBG on, BLOCK_BOOT and
+          # BLOCK_RECOVERY OFF so kernels/recovery stay flashable from the
+          # running system). Default OFF — push builds never take this path,
+          # and the git tree stays clean (integration happens on the runner
+          # workspace copy only).
+          # (Same resolve-then-verify pattern as KernelSU-Next above.)
+          BBG_COMMIT="$(git ls-remote https://github.com/vc-teahouse/Baseband-guard.git refs/heads/main | awk '{print $1; exit}')"
+          [[ "$BBG_COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "ERROR: could not resolve Baseband-Guard tip" >&2; exit 1; }
+          echo "Baseband-Guard tip: $BBG_COMMIT"
+          echo "bbg_commit=$BBG_COMMIT" >> "$GITHUB_OUTPUT"
+          # Pre-clone at the exact SHA: upstream main moves, so a fresh
+          # clone may no longer contain the pinned tree. (Same as NoMount.)
+          if [ ! -d "$WORK_DIR/common/Baseband-guard" ]; then
+            git clone --no-checkout https://github.com/vc-teahouse/Baseband-guard.git "$WORK_DIR/common/Baseband-guard"
+          fi
+          git -C "$WORK_DIR/common/Baseband-guard" fetch --depth=1 origin "$BBG_COMMIT"
+          git -C "$WORK_DIR/common/Baseband-guard" checkout --detach --quiet "$BBG_COMMIT"
+          [ "$(git -C "$WORK_DIR/common/Baseband-guard" rev-parse HEAD)" = "$BBG_COMMIT" ] || { echo "Baseband-Guard pin mismatch" >&2; exit 1; }
+          # --- setup.sh wiring, replicated on the pinned tree ---
+          SEC_DIR="$WORK_DIR/common/security"
+          if command -v realpath >/dev/null 2>&1; then
+            BBG_REL="$(realpath --relative-to="$SEC_DIR" "$WORK_DIR/common/Baseband-guard" 2>/dev/null || true)"
+          else
+            BBG_REL="$WORK_DIR/common/Baseband-guard"
+          fi
+          [ -n "$BBG_REL" ] || BBG_REL="$WORK_DIR/common/Baseband-guard"
+          ln -sfn "$BBG_REL" "$SEC_DIR/baseband-guard"
+          test -L "$SEC_DIR/baseband-guard" || { echo "ERROR: security/baseband-guard symlink missing" >&2; exit 1; }
+          grep -q 'baseband-guard/' "$SEC_DIR/Makefile" || \
+            printf '\nobj-$(CONFIG_BBG) += baseband-guard/\n' >> "$SEC_DIR/Makefile"
+          grep -q 'baseband-guard/' "$SEC_DIR/Makefile" || { echo "ERROR: security/Makefile BBG entry missing" >&2; exit 1; }
+          if ! grep -q 'security/baseband-guard/Kconfig' "$SEC_DIR/Kconfig"; then
+            awk '
+              { a[NR]=$0 } END{
+                last=0; for(i=1;i<=NR;i++) if(a[i] ~ /^endmenu[[:space:]]*$/) last=i;
+                for(i=1;i<=NR;i++){
+                  if(i==last) print "source \"security/baseband-guard/Kconfig\"";
+                  print a[i];
+                }
+              }' "$SEC_DIR/Kconfig" > "$SEC_DIR/Kconfig.tmp" && mv "$SEC_DIR/Kconfig.tmp" "$SEC_DIR/Kconfig"
+          fi
+          grep -q 'security/baseband-guard/Kconfig' "$SEC_DIR/Kconfig" || { echo "ERROR: security/Kconfig BBG source missing" >&2; exit 1; }
+          # CONFIG_LSM defaults: append baseband_guard (same sed as the
+          # upstream CI cloud-compile path).
+          sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' "$SEC_DIR/Kconfig"
+          grep -q 'baseband_guard' "$SEC_DIR/Kconfig" || { echo "ERROR: CONFIG_LSM defaults lack baseband_guard" >&2; exit 1; }
+          # --- rodin allowlist: SAFE SKIP (never fail the build) ---
+          # No rodin-specific partition allowlist has been validated, so the
+          # upstream-generic allowlist ships as-is. Record the warning for
+          # the summary/BuildInfo and continue.
+          RODIN_LIST="$WORK_DIR/common/arch/arm64/configs/evonix-bbg-rodin.allowlist"
+          if [ -s "$RODIN_LIST" ]; then
+            echo "BBG rodin allowlist override present — device-specific list in effect."
+            echo "bbg_allowlist=rodin" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::BBG uses the upstream-generic partition allowlist; no rodin-specific allowlist validated — modem/efisp/abl behaviour must still be validated on-device (see summary)."
+            echo "BBG WARNING: upstream-generic allowlist in effect (no evonix-bbg-rodin.allowlist). On-device validation still required." >> "$GITHUB_STEP_SUMMARY"
+            echo "bbg_allowlist=generic" >> "$GITHUB_OUTPUT"
+          fi
+          # BBG kernel configs from the committed fragment
+          # arch/arm64/configs/evonix-bbg.config (visible/auditable).
+          # Applied ephemerally on the runner copy; evonix.config untouched.
+          BBG_CONFIG="$WORK_DIR/common/arch/arm64/configs/evonix.config"
+          BBG_FRAG="$WORK_DIR/common/arch/arm64/configs/evonix-bbg.config"
+          test -s "$BBG_FRAG"
+          while IFS= read -r LINE || [ -n "$LINE" ]; do
+            case "$LINE" in
+              ''|'#'*) continue ;;
+              '# CONFIG_'*' is not set')
+                SYM="${LINE#'# '}"; SYM="${SYM%' is not set'}"
+                sed -i "/^${SYM}=y$/d" "$BBG_CONFIG"
+                grep -qx "$LINE" "$BBG_CONFIG" || echo "$LINE" >> "$BBG_CONFIG"
+                ;;
+              CONFIG_*'=y')
+                SYM="${LINE%'=y'}"
+                sed -i "/^# ${SYM} is not set$/d" "$BBG_CONFIG"
+                grep -qx "$LINE" "$BBG_CONFIG" || echo "$LINE" >> "$BBG_CONFIG"
+                ;;
+              *) echo "ERROR: unexpected line in evonix-bbg.config: $LINE" >&2; exit 1 ;;
+            esac
+          done < "$BBG_FRAG"
 
       - name: Restore Bazel cache
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.use_cache }}
@@ -443,12 +673,28 @@ jobs:
           [ -n "$KSU_PIN" ] || { echo "ERROR: KSU_PIN is empty (ksu_sha missing)" >&2; exit 1; }
           DS_PIN="${{ steps.ds.outputs.ds_commit }}"
           NM_PIN="${{ steps.nm.outputs.nm_commit }}"
+          NTSYNC_PIN="${{ steps.ntsync.outputs.ntsync_commit }}"
+          BBG_PIN="${{ steps.bbg.outputs.bbg_commit }}"
+          SUSFS_PIN="${{ steps.susfs.outputs.susfs_commit }}"
+          # SUSFS always runs (no `if:` on susfs): an empty pin means the
+          # step failed to publish susfs_commit — fail hard, never ship
+          # unknown SUSFS.
+          [ -n "$SUSFS_PIN" ] || { echo "ERROR: SUSFS_PIN is empty (susfs_commit missing)" >&2; exit 1; }
+          SUSFS_VER="${{ steps.susfs.outputs.susfs_ver }}"
+          [ -n "$SUSFS_VER" ] || { echo "ERROR: SUSFS_VER is empty (susfs_ver missing)" >&2; exit 1; }
           DS_STATUS="disabled"; [ -n "$DS_PIN" ] || DS_PIN="n/a"
           if [ "${DS_PIN}" != "n/a" ]; then DS_STATUS="enabled ($DS_PIN)"; fi
           NM_STATUS="disabled"; [ -n "$NM_PIN" ] || NM_PIN="n/a"
           if [ "${NM_PIN}" != "n/a" ]; then NM_STATUS="enabled ($NM_PIN)"; fi
-          SUSFS_VER="$(grep -m1 '#define SUSFS_VERSION' src/include/linux/susfs.h 2>/dev/null | awk -F'"' '{print $2}')"
-          [ -n "$SUSFS_VER" ] || SUSFS_VER="unknown"
+          NTSYNC_STATUS="disabled"; [ -n "$NTSYNC_PIN" ] || NTSYNC_PIN="n/a"
+          if [ "${NTSYNC_PIN}" != "n/a" ]; then NTSYNC_STATUS="enabled ($NTSYNC_PIN)"; fi
+          BBG_STATUS="disabled"; [ -n "$BBG_PIN" ] || BBG_PIN="n/a"
+          if [ "${BBG_PIN}" != "n/a" ]; then
+            BBG_ALLOW="${{ steps.bbg.outputs.bbg_allowlist }}"; BBG_ALLOW="${BBG_ALLOW:-generic}"
+            BBG_STATUS="enabled ($BBG_PIN, allowlist: $BBG_ALLOW)"
+          fi
+          # SUSFS_VER comes from the susfs step output (fail-hard above);
+          # never re-read it from the tree (susfs.h is not in-tree).
           KSTRING="$(grep -m1 '^kernel.string=' AnyKernel3/anykernel.sh | cut -d= -f2-)"
           BUILD_DATE="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
           # inputs.* is empty on push — default gracefully.
@@ -456,6 +702,8 @@ jobs:
           IN_CACHE="${{ inputs.use_cache }}"; IN_CACHE="${IN_CACHE:-true}"
           IN_DS="${{ inputs.use_ds }}"; IN_DS="${IN_DS:-false}"
           IN_NM="${{ inputs.use_nomount }}"; IN_NM="${IN_NM:-false}"
+          IN_NTSYNC="${{ inputs.use_ntsync }}"; IN_NTSYNC="${IN_NTSYNC:-false}"
+          IN_BBG="${{ inputs.use_bbg }}"; IN_BBG="${IN_BBG:-false}"
           STAGE="evonix-artifact"
           rm -rf "$STAGE"; mkdir -p "$STAGE"
           cp -a AnyKernel3/. "$STAGE/"
@@ -466,14 +714,16 @@ jobs:
           - Commit: $GITHUB_SHA (short: $SHORT_SHA)
           - Kernel: 6.6.$KVER ($KEXTRA)
           - KernelSU-Next: $KSU_PIN (dev-susfs @ pershoot/KernelSU-Next)
-          - SUSFS: $SUSFS_VER (in-tree include/linux/susfs.h)
+          - SUSFS: $SUSFS_VER ($SUSFS_PIN, floating gki-android15-6.6 tip @ simonpunk/susfs4ksu)
           - Droidspaces: $DS_STATUS
           - NoMount: $NM_STATUS
+          - NTSync: $NTSYNC_STATUS
+          - Baseband-Guard: $BBG_STATUS
           - AnyKernel3: $AK3_COMMIT (master @ osm0sis/AnyKernel3)
           - AnyKernel3 tools: $AK3_TOOLS_COMMIT (arm64-tools @ osm0sis/AnyKernel3, AArch64)
           - Toolchain: Clang 23.0.1 (android build 16311247, r614150) + ThinLTO + AutoFDO
           - Build date: $BUILD_DATE
-          - Inputs: release_type=$IN_REL, use_cache=$IN_CACHE, use_ds=$IN_DS, use_nomount=$IN_NM
+          - Inputs: release_type=$IN_REL, use_cache=$IN_CACHE, use_ds=$IN_DS, use_nomount=$IN_NM, use_ntsync=$IN_NTSYNC, use_bbg=$IN_BBG
           - kernel.string: $KSTRING
           - Image: $IMG_SIZE bytes, sha256 $IMG_SHA
           - Artifact: $BASE.zip (direct-flashable — AK3 top level + this BuildInfo, no inner zip)
@@ -493,17 +743,23 @@ jobs:
             echo ""
             echo "رویداد / Event: ${{ github.event_name }} | شاخه / Branch: ${{ github.ref_name }}"
             echo ""
-            echo "| inputs (use_ds/use_nomount/use_cache/release_type) | نتیجه / Result |"
+            echo "| inputs (use_ds/use_nomount/use_ntsync/use_bbg/use_cache/release_type) | نتیجه / Result |"
             echo "|---|---|"
-            echo "| $IN_DS / $IN_NM / $IN_CACHE / $IN_REL | 🗜️ $BASE.zip — مستقیم‌فلش / direct-flashable, Image $IMG_SIZE bytes, sha256 \`${IMG_SHA:0:16}…\` |"
+            echo "| $IN_DS / $IN_NM / $IN_NTSYNC / $IN_BBG / $IN_CACHE / $IN_REL | 🗜️ $BASE.zip — مستقیم‌فلش / direct-flashable, Image $IMG_SIZE bytes, sha256 \`${IMG_SHA:0:16}…\` |"
             echo ""
             echo "| Pin | مقدار / Value |"
             echo "|---|---|"
             echo "| KSU-Next | \`${KSU_PIN:-n/a}\` |"
-            echo "| SUSFS | \`$SUSFS_VER\` |"
+            echo "| SUSFS | \`$SUSFS_VER ($SUSFS_PIN)\` |"
             echo "| Droidspaces | \`$DS_STATUS\` |"
             echo "| NoMount | \`$NM_STATUS\` |"
+            echo "| NTSync | \`$NTSYNC_STATUS\` |"
+            echo "| Baseband-Guard | \`$BBG_STATUS\` |"
             echo "| AnyKernel3 | \`${AK3_COMMIT:-n/a}\` |"
+            if [ "$IN_BBG" = "true" ]; then
+              echo ""
+              echo "> ⚠️ BBG با allowlist ژنریک آپ‌استریم بیلد شد (allowlist اختصاصی rodin اعتبارسنجی نشده) — اعتبارسنجی روی دستگاه برای پارتیشن‌های modem/efisp/abl/modemst/fsg/fsc باقی مانده / BBG built with the upstream-generic allowlist (no validated rodin list) — on-device validation for modem/efisp/abl/modemst/fsg/fsc partitions is still required."
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload EVONIX artifact (zip + sha256 + BuildInfo)
@@ -558,7 +814,25 @@ jobs:
             [ -n "$NM_PIN" ] || NM_PIN="$(git ls-remote https://github.com/maxsteeel/nomount.git refs/heads/dev | awk '{print $1; exit}')"
             NM_STATUS="enabled ($NM_PIN)"
           fi
-          SUSFS_VER="$(grep -m1 '#define SUSFS_VERSION' include/linux/susfs.h | awk -F'"' '{print $2}')"
+          NTSYNC_PIN="${{ needs.build.outputs.ntsync_commit }}"
+          NTSYNC_STATUS="disabled"
+          if [ "${{ inputs.use_ntsync }}" = "true" ]; then
+            [ -n "$NTSYNC_PIN" ] || NTSYNC_PIN="$(git ls-remote https://github.com/WildKernels/kernel_patches.git refs/heads/main | awk '{print $1; exit}')"
+            NTSYNC_STATUS="enabled ($NTSYNC_PIN)"
+          fi
+          BBG_PIN="${{ needs.build.outputs.bbg_commit }}"
+          BBG_STATUS="disabled"
+          if [ "${{ inputs.use_bbg }}" = "true" ]; then
+            [ -n "$BBG_PIN" ] || BBG_PIN="$(git ls-remote https://github.com/vc-teahouse/Baseband-guard.git refs/heads/main | awk '{print $1; exit}')"
+            BBG_ALLOW="${{ needs.build.outputs.bbg_allowlist }}"; BBG_ALLOW="${BBG_ALLOW:-generic}"
+            BBG_STATUS="enabled ($BBG_PIN, allowlist: $BBG_ALLOW)"
+          fi
+          # SUSFS pin/ver come from the build job outputs (floating tip,
+          # resolved at build time); fallback to live tip resolve.
+          SUSFS_PIN="${{ needs.build.outputs.susfs_commit }}"
+          [ -n "$SUSFS_PIN" ] || SUSFS_PIN="$(git ls-remote https://gitlab.com/simonpunk/susfs4ksu.git refs/heads/gki-android15-6.6 | awk '{print $1; exit}')"
+          SUSFS_VER="${{ needs.build.outputs.susfs_ver }}"
+          [ -n "$SUSFS_VER" ] || SUSFS_VER="unknown"
           KEXTRA="$(grep -m1 '^EXTRAVERSION' Makefile | awk '{print $3}')"
           mapfile -t TAGS < <(gh api --paginate "repos/${{ github.repository }}/tags?per_page=100" --jq '.[].name' 2>/dev/null | grep -E '^evonix-v[0-9]+$' || true)
           MAX=0
@@ -574,9 +848,11 @@ jobs:
           - Commit: $COMMIT
           - Kernel: 6.6.x ($KEXTRA)
           - KernelSU-Next: $KSU_PIN (latest dev-susfs @ pershoot/KernelSU-Next)
-          - SUSFS: $SUSFS_VER (in-tree)
+          - SUSFS: $SUSFS_VER ($SUSFS_PIN, floating gki-android15-6.6 tip @ simonpunk/susfs4ksu)
           - Droidspaces: $DS_STATUS
           - NoMount: $NM_STATUS
+          - NTSync: $NTSYNC_STATUS
+          - Baseband-Guard: $BBG_STATUS
           - Toolchain: Clang 23.0.1 (android build 16311247, r614150) + ThinLTO + AutoFDO
           - Device: Poco X7 Pro (rodin)
           EOF

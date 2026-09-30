@@ -165,16 +165,18 @@ if grep -qx 'CONFIG_LTO_NONE=y' "$CFG"; then
     die "Final kernel unexpectedly contains CONFIG_LTO_NONE=y."
 fi
 
-KERNEL_VERSION="$(strings "$DIST/Image" | grep -m1 'Linux version' || true)"
+BANNER_LINES="$(strings "$DIST/Image" | grep 'Linux version' | head -n 5 || true)"
 
-echo "Banner:"
-echo "$KERNEL_VERSION"
+echo "Banner candidates:"
+echo "$BANNER_LINES"
+
+KERNEL_VERSION="$(grep -m1 'Linux version 6' <<<"$BANNER_LINES" || true)"
 
 grep -q 'clang version 23\.0\.1' <<<"$KERNEL_VERSION" ||
-    die "Built Image does not report Clang 23.0.1. Banner was: [$KERNEL_VERSION]"
+    die "Built Image does not report Clang 23.0.1. First matches were: [$BANNER_LINES]"
 
 grep -q 'r614150' <<<"$KERNEL_VERSION" ||
-    die "Built Image does not report r614150."
+    die "Built Image does not report r614150. Banner was: [$KERNEL_VERSION] (first matches: [$BANNER_LINES])"
 
 echo "Final config:"
 grep -E \

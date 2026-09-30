@@ -212,6 +212,20 @@ jobs:
           done
           grep -q '^CONFIG_KSU_SUSFS=y$' "$SUSFS_CONFIG"
           grep -q '^CONFIG_KSU_SUSFS_SUS_MAP=y$' "$SUSFS_CONFIG"
+          # SUSFS proof in logs: visible verification that the floating patch
+          # actually landed (tip, version, files, hooks, configs).
+          echo "===== SUSFS APPLIED ====="
+          echo "SUSFS tip: $SUSFS_TIP"
+          echo "SUSFS_VERSION: $SUSFS_VER"
+          echo "----- susfs files (git status) -----"
+          git -C "$WORK_DIR/common" status --porcelain | grep -i susfs || true
+          echo "----- susfs sources present -----"
+          ls "$WORK_DIR/common/fs/susfs.c" "$WORK_DIR/common/include/linux/susfs"*.h || true
+          echo "----- susfs hook markers (fs/proc/task_mmu.c) -----"
+          grep -c susfs "$WORK_DIR/common/fs/proc/task_mmu.c" || true
+          echo "----- CONFIG_KSU_SUSFS in evonix.config -----"
+          grep '^CONFIG_KSU_SUSFS' "$SUSFS_CONFIG" || true
+          echo "===== END SUSFS APPLIED ====="
 
       - name: Apply Droidspaces-OSS (optional, dispatch only)
         id: ds
@@ -737,17 +751,17 @@ jobs:
             grep -q "$ENTRY" <<<"$ZIP_LIST" || { echo "ERROR: staged artifact missing entry: $ENTRY" >&2; exit 1; }
           done
           rm -f "_verify_$BASE.zip"
-          # Bilingual build summary: config matrix → artifact result.
+          # English-only build summary: config matrix → artifact result.
           {
             echo "## EVONIX Build — $BASE"
             echo ""
-            echo "رویداد / Event: ${{ github.event_name }} | شاخه / Branch: ${{ github.ref_name }}"
+            echo "Event: ${{ github.event_name }} | Branch: ${{ github.ref_name }}"
             echo ""
-            echo "| inputs (use_ds/use_nomount/use_ntsync/use_bbg/use_cache/release_type) | نتیجه / Result |"
+            echo "| inputs (use_ds/use_nomount/use_ntsync/use_bbg/use_cache/release_type) | Result |"
             echo "|---|---|"
-            echo "| $IN_DS / $IN_NM / $IN_NTSYNC / $IN_BBG / $IN_CACHE / $IN_REL | 🗜️ $BASE.zip — مستقیم‌فلش / direct-flashable, Image $IMG_SIZE bytes, sha256 \`${IMG_SHA:0:16}…\` |"
+            echo "| $IN_DS / $IN_NM / $IN_NTSYNC / $IN_BBG / $IN_CACHE / $IN_REL | 🗜️ $BASE.zip — direct-flashable, Image $IMG_SIZE bytes, sha256 \`${IMG_SHA:0:16}…\` |"
             echo ""
-            echo "| Pin | مقدار / Value |"
+            echo "| Pin | Value |"
             echo "|---|---|"
             echo "| KSU-Next | \`${KSU_PIN:-n/a}\` |"
             echo "| SUSFS | \`$SUSFS_VER ($SUSFS_PIN)\` |"
@@ -758,7 +772,7 @@ jobs:
             echo "| AnyKernel3 | \`${AK3_COMMIT:-n/a}\` |"
             if [ "$IN_BBG" = "true" ]; then
               echo ""
-              echo "> ⚠️ BBG با allowlist ژنریک آپ‌استریم بیلد شد (allowlist اختصاصی rodin اعتبارسنجی نشده) — اعتبارسنجی روی دستگاه برای پارتیشن‌های modem/efisp/abl/modemst/fsg/fsc باقی مانده / BBG built with the upstream-generic allowlist (no validated rodin list) — on-device validation for modem/efisp/abl/modemst/fsg/fsc partitions is still required."
+            echo "> ⚠️ BBG built with the upstream-generic allowlist (no validated rodin list) — on-device validation for modem/efisp/abl/modemst/fsg/fsc partitions is still required."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 

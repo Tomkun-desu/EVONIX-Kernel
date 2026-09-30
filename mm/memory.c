@@ -6536,7 +6536,7 @@ int __access_remote_vm(struct mm_struct *mm, unsigned long addr, void *buf,
 
 		if (vma && vma->vm_file && SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file)))
 			break;
-
+		
 		page = get_user_page_vma_remote(mm, addr,
 							     gup_flags, &vma);
 #else

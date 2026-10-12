@@ -529,29 +529,40 @@ jobs:
           # 6. Multiline parens-equality (same Clang error, EOL-open shape):
           #    The ||/&& continuation lives inside an #if that is OFF in our
           #    build, so after preprocessing only if ((X)) + lone ) remains.
-          #    The open line has NO trailing ')' — so the fix drops ONLY the
-          #    second '(' (never append a ')' or the lone closer dangles).
+          #    Rule: drop the TRAILING ')' of the open line so the if paren
+          #    stays open until the lone closer (dropping the 2nd '(' instead
+          #    closes the if early and leaves the closer dangling — proven by
+          #    a full local kbuild sweep: all 157 driver objects, zero errors).
           #    rtl8812a_phycfg.c:1807 — || inside #if (MP_DRIVER == 1);
-          #    MP_DRIVER=0 (CONFIG_MP_INCLUDED=n), guard stripped.
-          grep -qF 'if ((pHalData->bNeedIQK' "$WIFI_DST/hal/rtl8812a/rtl8812a_phycfg.c" && \
-            sed -i 's|if ((pHalData|if (pHalData|' "$WIFI_DST/hal/rtl8812a/rtl8812a_phycfg.c"
-          grep -qF 'if (pHalData->bNeedIQK' "$WIFI_DST/hal/rtl8812a/rtl8812a_phycfg.c" && \
+          #    MP_DRIVER=0 (CONFIG_MP_INCLUDED=n), guard stripped. The $ anchor
+          #    keeps the clean compound ifs at 1418-1424 (which END in '))')
+          #    from ever matching.
+          grep -qF 'if ((pHalData->bNeedIQK == _TRUE)' "$WIFI_DST/hal/rtl8812a/rtl8812a_phycfg.c" && \
+            sed -i 's|if ((pHalData->bNeedIQK == _TRUE)$|if (pHalData->bNeedIQK == _TRUE|' "$WIFI_DST/hal/rtl8812a/rtl8812a_phycfg.c"
+          grep -q 'if (pHalData->bNeedIQK == _TRUE$' "$WIFI_DST/hal/rtl8812a/rtl8812a_phycfg.c" && \
             ! grep -qF 'if ((pHalData->bNeedIQK' "$WIFI_DST/hal/rtl8812a/rtl8812a_phycfg.c" || { echo "ERROR: paren fix missing rtl8812a_phycfg.c" >&2; exit 1; }
-          #    rtw_beamforming.c:1475 — && inside #ifdef CONFIG_80211AC_VHT.
-          #    VHT is defined today so the && survives (safe today); fix anyway
-          #    so a future VHT-off build keeps passing instead of costing
-          #    another 40-minute round trip.
-          grep -qF 'if ((0 == htpriv' "$WIFI_DST/core/rtw_beamforming.c" && \
-            sed -i 's|if ((0 == htpriv|if (0 == htpriv|' "$WIFI_DST/core/rtw_beamforming.c"
-          grep -qF 'if (0 == htpriv->beamform_cap' "$WIFI_DST/core/rtw_beamforming.c" && \
-            ! grep -qF 'if ((0 == htpriv' "$WIFI_DST/core/rtw_beamforming.c" || { echo "ERROR: paren fix missing rtw_beamforming.c" >&2; exit 1; }
+          #    rtw_beamforming.c:1475 — DEAD CODE, do NOT touch: the whole file
+          #    sits inside #ifdef CONFIG_BEAMFORMING which is commented out in
+          #    autoconf.h, so the compiler never sees it (verified: no .o is
+          #    ever produced). An earlier sweep "fixed" it anyway — reverted.
           #    usb_halinit.c:388 — same EOL-open shape, but the open line ends
           #    with '))' (macro arg paren + if paren): drop the 2nd '(' AND the
           #    line-trailing ')'. Guard CONFIG_USB_INTERRUPT_IN_PIPE is off.
           grep -qF 'if ((IS_FULL_SPEED_USB' "$WIFI_DST/hal/rtl8812a/usb/usb_halinit.c" && \
-            sed -i 's|if ((IS_FULL_SPEED_USB(Adapter))|if (IS_FULL_SPEED_USB(Adapter)|' "$WIFI_DST/hal/rtl8812a/usb/usb_halinit.c"
-          grep -qF 'if (IS_FULL_SPEED_USB(Adapter)' "$WIFI_DST/hal/rtl8812a/usb/usb_halinit.c" && \
+            sed -i 's|if ((IS_FULL_SPEED_USB(Adapter))$|if (IS_FULL_SPEED_USB(Adapter)|' "$WIFI_DST/hal/rtl8812a/usb/usb_halinit.c"
+          grep -q 'if (IS_FULL_SPEED_USB(Adapter)$' "$WIFI_DST/hal/rtl8812a/usb/usb_halinit.c" && \
             ! grep -qF 'if ((IS_FULL_SPEED_USB' "$WIFI_DST/hal/rtl8812a/usb/usb_halinit.c" || { echo "ERROR: paren fix missing usb_halinit.c" >&2; exit 1; }
+          # 7. phydm_api.c sometimes-uninit (GCC silent, Clang -Werror):
+          #    reg_txagc/reg_mask unset on switch-default and RF-path-else
+          #    (phydm_get_txagc_value_for_display, ~line 3127). Init to 0 at
+          #    declaration — found by a full local kbuild sweep (all 157
+          #    driver objects, zero errors), CI never reached this file.
+          grep -q 'u32 reg_txagc;$' "$WIFI_DST/hal/phydm/phydm_api.c" && \
+            sed -i 's|^\tu32 reg_txagc;$|\tu32 reg_txagc = 0;|' "$WIFI_DST/hal/phydm/phydm_api.c"
+          grep -q 'u32 reg_mask;$' "$WIFI_DST/hal/phydm/phydm_api.c" && \
+            sed -i 's|^\tu32 reg_mask;$|\tu32 reg_mask = 0;|' "$WIFI_DST/hal/phydm/phydm_api.c"
+          grep -q 'u32 reg_txagc = 0;' "$WIFI_DST/hal/phydm/phydm_api.c" && \
+            grep -q 'u32 reg_mask = 0;' "$WIFI_DST/hal/phydm/phydm_api.c" || { echo "ERROR: phydm init missing" >&2; exit 1; }
           # Fail-hard guards: driver Kconfig + USB device table + monitor flag.
           grep -q '^config RTL8821AU$' "$WIFI_DST/Kconfig" || { echo "ERROR: config RTL8821AU missing from driver Kconfig" >&2; exit 1; }
           grep -q '0x2357, 0x011F' "$WIFI_DST/os_dep/linux/usb_intf.c" || { echo "ERROR: USB ID 2357:011F missing from usb_intf.c" >&2; exit 1; }

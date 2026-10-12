@@ -482,6 +482,22 @@ jobs:
           grep -q '^#ifndef _RTL88812A_SRESET_H_$' "$WIFI_DST/include/rtl8812a_sreset.h" && \
             sed -i 's|^#ifndef _RTL88812A_SRESET_H_$|#ifndef _RTL8812A_SRESET_H_|' "$WIFI_DST/include/rtl8812a_sreset.h"
           grep -q '^#ifndef _RTL8812A_SRESET_H_$' "$WIFI_DST/include/rtl8812a_sreset.h" || { echo "ERROR: header-guard fix not applied" >&2; exit 1; }
+          # 4. rtw_mlme_ext.c Clang -Werror trio (GCC never noticed):
+          #  a. BA_starting_seqctrl used uninit when psta==NULL (line ~10349):
+          #     init to 0 at declaration (matches sibling BA_* inits).
+          grep -q 'u16.BA_starting_seqctrl;$' "$WIFI_DST/core/rtw_mlme_ext.c" && \
+            sed -i 's|^\tu16\tBA_starting_seqctrl;$|\tu16\tBA_starting_seqctrl = 0;|' "$WIFI_DST/core/rtw_mlme_ext.c"
+          grep -q 'BA_starting_seqctrl = 0;' "$WIFI_DST/core/rtw_mlme_ext.c" || { echo "ERROR: BA_starting_seqctrl init missing" >&2; exit 1; }
+          #  b. extraneous parens (line ~12676): single-paren.
+          grep -q 'if ((padapter->tdlsinfo.link_established == _TRUE)) {' "$WIFI_DST/core/rtw_mlme_ext.c" && \
+            sed -i 's|if ((padapter->tdlsinfo.link_established == _TRUE)) {|if (padapter->tdlsinfo.link_established == _TRUE) {|' "$WIFI_DST/core/rtw_mlme_ext.c"
+          grep -q 'if (padapter->tdlsinfo.link_established == _TRUE) {' "$WIFI_DST/core/rtw_mlme_ext.c" || { echo "ERROR: parens fix not applied" >&2; exit 1; }
+          #  c. back_ch/back_bw/back_ch_offset maybe-uninit when MCC off
+          #     (line ~14899): init to 0 at declaration. NOTE: no ^ anchor —
+          #     the declaration line is tab-indented inside a case block.
+          grep -q 'u8 back_ch, back_bw, back_ch_offset;$' "$WIFI_DST/core/rtw_mlme_ext.c" && \
+            sed -i 's|u8 back_ch, back_bw, back_ch_offset;|u8 back_ch = 0, back_bw = 0, back_ch_offset = 0;|' "$WIFI_DST/core/rtw_mlme_ext.c"
+          grep -q 'u8 back_ch = 0, back_bw = 0, back_ch_offset = 0;' "$WIFI_DST/core/rtw_mlme_ext.c" || { echo "ERROR: back_ch init missing" >&2; exit 1; }
           # Fail-hard guards: driver Kconfig + USB device table + monitor flag.
           grep -q '^config RTL8821AU$' "$WIFI_DST/Kconfig" || { echo "ERROR: config RTL8821AU missing from driver Kconfig" >&2; exit 1; }
           grep -q '0x2357, 0x011F' "$WIFI_DST/os_dep/linux/usb_intf.c" || { echo "ERROR: USB ID 2357:011F missing from usb_intf.c" >&2; exit 1; }

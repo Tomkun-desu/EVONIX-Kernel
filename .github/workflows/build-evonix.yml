@@ -475,6 +475,13 @@ jobs:
           grep -q '^#elseif defined(CONFIG_CUSTOMER_EZVIZ_CHIME2)$' "$WIFI_DST/include/rtw_mlme_ext.h" && \
             sed -i 's|^#elseif defined(CONFIG_CUSTOMER_EZVIZ_CHIME2)$|#elif defined(CONFIG_CUSTOMER_EZVIZ_CHIME2)|' "$WIFI_DST/include/rtw_mlme_ext.h"
           grep -q '^#elif defined(CONFIG_CUSTOMER_EZVIZ_CHIME2)$' "$WIFI_DST/include/rtw_mlme_ext.h" || { echo "ERROR: elseif fix not applied" >&2; exit 1; }
+          # 3. rtl8812a_sreset.h:15 uses _RTL88812A_SRESET_H_ as the #ifndef
+          #    guard but defines _RTL8812A_SRESET_H_ (typo, GCC never
+          #    noticed). Clang -Wheader-guard errors. Align ifndef to the
+          #    defined macro.
+          grep -q '^#ifndef _RTL88812A_SRESET_H_$' "$WIFI_DST/include/rtl8812a_sreset.h" && \
+            sed -i 's|^#ifndef _RTL88812A_SRESET_H_$|#ifndef _RTL8812A_SRESET_H_|' "$WIFI_DST/include/rtl8812a_sreset.h"
+          grep -q '^#ifndef _RTL8812A_SRESET_H_$' "$WIFI_DST/include/rtl8812a_sreset.h" || { echo "ERROR: header-guard fix not applied" >&2; exit 1; }
           # Fail-hard guards: driver Kconfig + USB device table + monitor flag.
           grep -q '^config RTL8821AU$' "$WIFI_DST/Kconfig" || { echo "ERROR: config RTL8821AU missing from driver Kconfig" >&2; exit 1; }
           grep -q '0x2357, 0x011F' "$WIFI_DST/os_dep/linux/usb_intf.c" || { echo "ERROR: USB ID 2357:011F missing from usb_intf.c" >&2; exit 1; }

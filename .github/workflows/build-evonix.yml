@@ -34,6 +34,10 @@ on:
         description: "NTSync driver (Wine/Proton sync primitives) + CONFIG_NTSYNC"
         type: boolean
         default: false
+      use_wifi:
+        description: "RTL8821AU USB WiFi (monitor mode + injection) + WLAN/CFG80211 stack"
+        type: boolean
+        default: false
       use_bbg:
         description: "Baseband-Guard LSM + CONFIG_BBG (generic allowlist until rodin validated)"
         type: boolean
@@ -62,6 +66,7 @@ jobs:
       ds_commit: ${{ steps.ds.outputs.ds_commit }}
       nm_commit: ${{ steps.nm.outputs.nm_commit }}
       ntsync_commit: ${{ steps.ntsync.outputs.ntsync_commit }}
+      wifi_commit: ${{ steps.wifi.outputs.wifi_commit }}
       bbg_commit: ${{ steps.bbg.outputs.bbg_commit }}
       bbg_allowlist: ${{ steps.bbg.outputs.bbg_allowlist }}
     steps:
@@ -397,6 +402,85 @@ jobs:
             esac
           done < "$NTSYNC_FRAG"
 
+      - name: Apply RTL8821AU USB WiFi (optional, dispatch only)
+        id: wifi
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.use_wifi }}
+        run: |
+          set -euo pipefail
+          # Optional RTL8821AU out-of-tree USB WiFi driver
+          # (morrownr/8821au-20210708, main branch): monitor mode + frame
+          # injection for RTL8811AU/RTL8821AU adapters (e.g. TP-Link
+          # 2357:011f, already in the driver's usb_intf.c table).
+          # Integration happens on the runner workspace copy only; the git
+          # tree stays clean (only the evonix-wifi.config fragment is
+          # committed). Builtin (=y) only — a =m module would need
+          # modules.bzl registration + a dist/copy step this workflow lacks.
+          # (Same resolve-then-verify pattern as the steps above.)
+          WIFI_COMMIT="$(git ls-remote https://github.com/morrownr/8821au-20210708.git refs/heads/main | awk '{print $1; exit}')"
+          [[ "$WIFI_COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "ERROR: could not resolve 8821au tip" >&2; exit 1; }
+          echo "8821au tip: $WIFI_COMMIT"
+          echo "wifi_commit=$WIFI_COMMIT" >> "$GITHUB_OUTPUT"
+          for i in 1 2 3 4 5; do rm -rf "$RUNNER_TEMP/rtl8821au" && git clone --depth=1 https://github.com/morrownr/8821au-20210708.git "$RUNNER_TEMP/rtl8821au" && break || sleep 5; done
+          [ -d "$RUNNER_TEMP/rtl8821au/.git" ] || { echo "ERROR: 8821au clone failed" >&2; exit 1; }
+          git -C "$RUNNER_TEMP/rtl8821au" fetch --depth=1 origin "$WIFI_COMMIT"
+          git -C "$RUNNER_TEMP/rtl8821au" checkout "$WIFI_COMMIT"
+          [ "$(git -C "$RUNNER_TEMP/rtl8821au" rev-parse HEAD)" = "$WIFI_COMMIT" ] || { echo "8821au pin mismatch" >&2; exit 1; }
+          # Upstream Makefile defaults target USB already (CONFIG_USB_HCI=y,
+          # CONFIG_RTL8821A=y, CONFIG_WIFI_MONITOR=y), so no source edits.
+          WIFI_DST="$WORK_DIR/common/drivers/net/wireless/rtl8821au"
+          rm -rf "$WIFI_DST"
+          mkdir -p "$WIFI_DST"
+          cp -a "$RUNNER_TEMP/rtl8821au/." "$WIFI_DST/"
+          rm -rf "$WIFI_DST/.git"
+          # Wire Kconfig + Makefile (in-tree kbuild entry points).
+          grep -q 'source "drivers/net/wireless/rtl8821au/Kconfig"' "$WORK_DIR/common/drivers/net/wireless/Kconfig" || \
+            sed -i 's|source "drivers/net/wireless/realtek/Kconfig"|source "drivers/net/wireless/realtek/Kconfig"\nsource "drivers/net/wireless/rtl8821au/Kconfig"|' "$WORK_DIR/common/drivers/net/wireless/Kconfig"
+          grep -q 'source "drivers/net/wireless/rtl8821au/Kconfig"' "$WORK_DIR/common/drivers/net/wireless/Kconfig" || { echo "ERROR: rtl8821au Kconfig source missing" >&2; exit 1; }
+          grep -q 'rtl8821au/' "$WORK_DIR/common/drivers/net/wireless/Makefile" || \
+            printf '\nobj-$(CONFIG_RTL8821AU) += rtl8821au/\n' >> "$WORK_DIR/common/drivers/net/wireless/Makefile"
+          grep -q 'rtl8821au/' "$WORK_DIR/common/drivers/net/wireless/Makefile" || { echo "ERROR: rtl8821au Makefile entry missing" >&2; exit 1; }
+          # cfg80211 path: the upstream Makefile only defines
+          # -DCONFIG_IOCTL_CFG80211 inside per-platform ifeq blocks (none of
+          # them ARM64-generic). Inject it via USER_EXTRA_CFLAGS so the
+          # in-tree build takes the ioctl_cfg80211.o path.
+          grep -q 'USER_EXTRA_CFLAGS.*CONFIG_IOCTL_CFG80211' "$WIFI_DST/Makefile" || \
+            sed -i '1i USER_EXTRA_CFLAGS += -DCONFIG_IOCTL_CFG80211 -DRTW_USE_CFG80211_STA_EVENT' "$WIFI_DST/Makefile"
+          grep -q 'CONFIG_IOCTL_CFG80211' "$WIFI_DST/Makefile" || { echo "ERROR: cfg80211 flag injection missing" >&2; exit 1; }
+          # Fail-hard guards: driver Kconfig + USB device table + monitor flag.
+          grep -q '^config RTL8821AU$' "$WIFI_DST/Kconfig" || { echo "ERROR: config RTL8821AU missing from driver Kconfig" >&2; exit 1; }
+          grep -q '0x2357, 0x011F' "$WIFI_DST/os_dep/linux/usb_intf.c" || { echo "ERROR: USB ID 2357:011F missing from usb_intf.c" >&2; exit 1; }
+          grep -qx 'CONFIG_WIFI_MONITOR = y' "$WIFI_DST/Makefile" || { echo "ERROR: CONFIG_WIFI_MONITOR not y in driver Makefile" >&2; exit 1; }
+          # WiFi kernel configs from the committed fragment
+          # arch/arm64/configs/evonix-wifi.config (visible/auditable).
+          # Applied ephemerally on the runner copy; evonix.config untouched.
+          WIFI_CONFIG="$WORK_DIR/common/arch/arm64/configs/evonix.config"
+          WIFI_FRAG="$WORK_DIR/common/arch/arm64/configs/evonix-wifi.config"
+          test -s "$WIFI_FRAG"
+          while IFS= read -r LINE || [ -n "$LINE" ]; do
+            case "$LINE" in
+              ''|'#'*) continue ;;
+              '# CONFIG_'*' is not set')
+                SYM="${LINE#'# '}"; SYM="${SYM%' is not set'}"
+                sed -i "/^${SYM}=y$/d" "$WIFI_CONFIG"
+                grep -qx "$LINE" "$WIFI_CONFIG" || echo "$LINE" >> "$WIFI_CONFIG"
+                ;;
+              CONFIG_*'=y')
+                SYM="${LINE%'=y'}"
+                sed -i "/^# ${SYM} is not set$/d" "$WIFI_CONFIG"
+                grep -qx "$LINE" "$WIFI_CONFIG" || echo "$LINE" >> "$WIFI_CONFIG"
+                ;;
+              *) echo "ERROR: unexpected line in evonix-wifi.config: $LINE" >&2; exit 1 ;;
+            esac
+          done < "$WIFI_FRAG"
+          echo "===== WIFI APPLIED ====="
+          echo "8821au pinned SHA: $WIFI_COMMIT"
+          echo "Driver dir: drivers/net/wireless/rtl8821au/"
+          grep -q 'source "drivers/net/wireless/rtl8821au/Kconfig"' "$WORK_DIR/common/drivers/net/wireless/Kconfig" && echo "Kconfig wiring: OK"
+          grep -q 'rtl8821au/' "$WORK_DIR/common/drivers/net/wireless/Makefile" && echo "Makefile wiring: OK"
+          echo "----- evonix.config WiFi symbols -----"
+          grep -E '^CONFIG_(WLAN|WLAN_VENDOR_REALTEK|CFG80211|MAC80211|RFKILL|RTL8821AU)=' "$WIFI_CONFIG" || true
+          echo "===== END WIFI APPLIED ====="
+
       - name: Apply Baseband-Guard (optional, dispatch only)
         id: bbg
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.use_bbg }}
@@ -697,6 +781,7 @@ jobs:
           DS_PIN="${{ steps.ds.outputs.ds_commit }}"
           NM_PIN="${{ steps.nm.outputs.nm_commit }}"
           NTSYNC_PIN="${{ steps.ntsync.outputs.ntsync_commit }}"
+          WIFI_PIN="${{ steps.wifi.outputs.wifi_commit }}"
           BBG_PIN="${{ steps.bbg.outputs.bbg_commit }}"
           SUSFS_PIN="${{ steps.susfs.outputs.susfs_commit }}"
           # SUSFS always runs (no `if:` on susfs): an empty pin means the
@@ -711,6 +796,8 @@ jobs:
           if [ "${NM_PIN}" != "n/a" ]; then NM_STATUS="enabled ($NM_PIN)"; fi
           NTSYNC_STATUS="disabled"; [ -n "$NTSYNC_PIN" ] || NTSYNC_PIN="n/a"
           if [ "${NTSYNC_PIN}" != "n/a" ]; then NTSYNC_STATUS="enabled ($NTSYNC_PIN)"; fi
+          WIFI_STATUS="disabled"; [ -n "$WIFI_PIN" ] || WIFI_PIN="n/a"
+          if [ "${WIFI_PIN}" != "n/a" ]; then WIFI_STATUS="enabled ($WIFI_PIN)"; fi
           BBG_STATUS="disabled"; [ -n "$BBG_PIN" ] || BBG_PIN="n/a"
           if [ "${BBG_PIN}" != "n/a" ]; then
             BBG_ALLOW="${{ steps.bbg.outputs.bbg_allowlist }}"; BBG_ALLOW="${BBG_ALLOW:-generic}"
@@ -726,6 +813,7 @@ jobs:
           IN_DS="${{ inputs.use_ds }}"; IN_DS="${IN_DS:-false}"
           IN_NM="${{ inputs.use_nomount }}"; IN_NM="${IN_NM:-false}"
           IN_NTSYNC="${{ inputs.use_ntsync }}"; IN_NTSYNC="${IN_NTSYNC:-false}"
+          IN_WIFI="${{ inputs.use_wifi }}"; IN_WIFI="${IN_WIFI:-false}"
           IN_BBG="${{ inputs.use_bbg }}"; IN_BBG="${IN_BBG:-false}"
           STAGE="evonix-artifact"
           rm -rf "$STAGE"; mkdir -p "$STAGE"
@@ -741,12 +829,13 @@ jobs:
           - Droidspaces: $DS_STATUS
           - NoMount: $NM_STATUS
           - NTSync: $NTSYNC_STATUS
+          - RTL8821AU WiFi: $WIFI_STATUS
           - Baseband-Guard: $BBG_STATUS
           - AnyKernel3: $AK3_COMMIT (master @ osm0sis/AnyKernel3)
           - AnyKernel3 tools: $AK3_TOOLS_COMMIT (arm64-tools @ osm0sis/AnyKernel3, AArch64)
           - Toolchain: Clang 23.0.1 (android build 16311247, r614150) + ThinLTO + AutoFDO
           - Build date: $BUILD_DATE
-          - Inputs: release_type=$IN_REL, use_cache=$IN_CACHE, use_ds=$IN_DS, use_nomount=$IN_NM, use_ntsync=$IN_NTSYNC, use_bbg=$IN_BBG
+          - Inputs: release_type=$IN_REL, use_cache=$IN_CACHE, use_ds=$IN_DS, use_nomount=$IN_NM, use_ntsync=$IN_NTSYNC, use_wifi=$IN_WIFI, use_bbg=$IN_BBG
           - kernel.string: $KSTRING
           - Image: $IMG_SIZE bytes, sha256 $IMG_SHA
           - Artifact: $BASE.zip (direct-flashable — AK3 top level + this BuildInfo, no inner zip)
@@ -766,9 +855,9 @@ jobs:
             echo ""
             echo "Event: ${{ github.event_name }} | Branch: ${{ github.ref_name }}"
             echo ""
-            echo "| inputs (use_ds/use_nomount/use_ntsync/use_bbg/use_cache/release_type) | Result |"
+            echo "| inputs (use_ds/use_nomount/use_ntsync/use_wifi/use_bbg/use_cache/release_type) | Result |"
             echo "|---|---|"
-            echo "| $IN_DS / $IN_NM / $IN_NTSYNC / $IN_BBG / $IN_CACHE / $IN_REL | 🗜️ $BASE.zip — direct-flashable, Image $IMG_SIZE bytes, sha256 \`${IMG_SHA:0:16}…\` |"
+            echo "| $IN_DS / $IN_NM / $IN_NTSYNC / $IN_WIFI / $IN_BBG / $IN_CACHE / $IN_REL | 🗜️ $BASE.zip — direct-flashable, Image $IMG_SIZE bytes, sha256 \`${IMG_SHA:0:16}…\` |"
             echo ""
             echo "| Pin | Value |"
             echo "|---|---|"
@@ -777,6 +866,7 @@ jobs:
             echo "| Droidspaces | \`$DS_STATUS\` |"
             echo "| NoMount | \`$NM_STATUS\` |"
             echo "| NTSync | \`$NTSYNC_STATUS\` |"
+            echo "| RTL8821AU WiFi | \`$WIFI_STATUS\` |"
             echo "| Baseband-Guard | \`$BBG_STATUS\` |"
             echo "| AnyKernel3 | \`${AK3_COMMIT:-n/a}\` |"
             if [ "$IN_BBG" = "true" ]; then
@@ -843,6 +933,12 @@ jobs:
             [ -n "$NTSYNC_PIN" ] || NTSYNC_PIN="$(git ls-remote https://github.com/WildKernels/kernel_patches.git refs/heads/main | awk '{print $1; exit}')"
             NTSYNC_STATUS="enabled ($NTSYNC_PIN)"
           fi
+          WIFI_PIN="${{ needs.build.outputs.wifi_commit }}"
+          WIFI_STATUS="disabled"
+          if [ "${{ inputs.use_wifi }}" = "true" ]; then
+            [ -n "$WIFI_PIN" ] || WIFI_PIN="$(git ls-remote https://github.com/morrownr/8821au-20210708.git refs/heads/main | awk '{print $1; exit}')"
+            WIFI_STATUS="enabled ($WIFI_PIN)"
+          fi
           BBG_PIN="${{ needs.build.outputs.bbg_commit }}"
           BBG_STATUS="disabled"
           if [ "${{ inputs.use_bbg }}" = "true" ]; then
@@ -875,6 +971,7 @@ jobs:
           - Droidspaces: $DS_STATUS
           - NoMount: $NM_STATUS
           - NTSync: $NTSYNC_STATUS
+          - RTL8821AU WiFi: $WIFI_STATUS
           - Baseband-Guard: $BBG_STATUS
           - Toolchain: Clang 23.0.1 (android build 16311247, r614150) + ThinLTO + AutoFDO
           - Device: Poco X7 Pro (rodin)

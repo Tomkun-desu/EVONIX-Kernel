@@ -110,7 +110,11 @@ jobs:
           cd "$WORK_DIR"
           repo init -u https://android.googlesource.com/kernel/manifest \
             -b common-android15-6.6-lts --depth=1
-          repo sync -c -j"$(nproc)"
+          # repo sync is resumable/idempotent: retry the whole sync on
+          # transient fetch failures (HTTP 503 from googlesource hits the
+          # huge prebuilts repos first). Each attempt continues where the
+          # previous one stopped.
+          for i in 1 2 3; do repo sync -c -j"$(nproc)" && break || { [ "$i" -eq 3 ] && exit 1; sleep 30; }; done
           # This repo IS the common/ project: replace the manifest's common/
           # with the checked-out EVONIX source (keeps EVONIX .git history).
           rm -rf "$WORK_DIR/common"

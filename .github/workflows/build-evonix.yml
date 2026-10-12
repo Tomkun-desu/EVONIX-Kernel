@@ -162,10 +162,15 @@ jobs:
           # merge ephemerally here. KSU (dev-susfs fork) untouched.
           # (Same resolve-then-verify pattern as KernelSU-Next above.)
           SUSFS_URL="https://gitlab.com/simonpunk/susfs4ksu.git"
+          SUSFS_MIRROR="https://github.com/ShirkNeko/susfs4ksu.git"
           SUSFS_BRANCH="gki-android15-6.6"
           SUSFS_TIP=""
-          for i in 1 2 3 4 5; do SUSFS_TIP="$(git ls-remote "$SUSFS_URL" "refs/heads/$SUSFS_BRANCH" | awk '{print $1; exit}' || true)"; [[ "$SUSFS_TIP" =~ ^[0-9a-f]{40}$ ]] && break || { SUSFS_TIP=""; sleep 15; }; done
+          for remote in "$SUSFS_URL" "$SUSFS_MIRROR"; do
+            for i in 1 2 3 4 5; do SUSFS_TIP="$(git ls-remote "$remote" "refs/heads/$SUSFS_BRANCH" | awk '{print $1; exit}' || true)"; [[ "$SUSFS_TIP" =~ ^[0-9a-f]{40}$ ]] && break || { SUSFS_TIP=""; sleep 15; }; done
+            if [[ "$SUSFS_TIP" =~ ^[0-9a-f]{40}$ ]]; then SUSFS_URL="$remote"; break; fi
+          done
           [[ "$SUSFS_TIP" =~ ^[0-9a-f]{40}$ ]] || { echo "ERROR: could not resolve SUSFS tip" >&2; exit 1; }
+          [ "$SUSFS_URL" = "$SUSFS_MIRROR" ] && echo "WARNING: GitLab unreachable, building SUSFS from GitHub mirror ($SUSFS_MIRROR)" >&2
           echo "SUSFS tip: $SUSFS_TIP"
           echo "susfs_commit=$SUSFS_TIP" >> "$GITHUB_OUTPUT"
           for i in 1 2 3 4 5; do rm -rf "${RUNNER_TEMP:?}/susfs4ksu"; git clone --depth=1 -b "$SUSFS_BRANCH" "$SUSFS_URL" "$RUNNER_TEMP/susfs4ksu" && break || sleep 5; done

@@ -446,6 +446,21 @@ jobs:
           grep -q 'USER_EXTRA_CFLAGS.*CONFIG_IOCTL_CFG80211' "$WIFI_DST/Makefile" || \
             sed -i '1i USER_EXTRA_CFLAGS += -DCONFIG_IOCTL_CFG80211 -DRTW_USE_CFG80211_STA_EVENT' "$WIFI_DST/Makefile"
           grep -q 'CONFIG_IOCTL_CFG80211' "$WIFI_DST/Makefile" || { echo "ERROR: cfg80211 flag injection missing" >&2; exit 1; }
+          # Clang-compat: the kernel builds with -Werror and Clang does not
+          # know GCC-only -Wno-enum-int-mismatch / -Wno-stringop-overread
+          # (driver Makefile options). -Wno-unknown-warning-option makes
+          # Clang ignore unknown -Wno-* instead of erroring.
+          grep -q 'Wno-unknown-warning-option' "$WIFI_DST/Makefile" || \
+            sed -i '1i ccflags-y += -Wno-unknown-warning-option' "$WIFI_DST/Makefile"
+          grep -q 'Wno-unknown-warning-option' "$WIFI_DST/Makefile" || { echo "ERROR: clang-compat flag missing" >&2; exit 1; }
+          # Robust include paths: srctree-absolute, in addition to the
+          # upstream -I$(src)/... lines. Inserted right after the
+          # obj-$(CONFIG_RTL8821AU) line so they stay inside the
+          # KERNELRELEASE-gated in-tree branch.
+          grep -q 'srctree)/drivers/net/wireless/rtl8821au/include' "$WIFI_DST/Makefile" || \
+            sed -i '/^obj-$(CONFIG_RTL8821AU)/a ccflags-y += -I$(srctree)/drivers/net/wireless/rtl8821au/include\nccflags-y += -I$(srctree)/drivers/net/wireless/rtl8821au/platform\nccflags-y += -I$(srctree)/drivers/net/wireless/rtl8821au/hal/btc\nccflags-y += -I$(srctree)/drivers/net/wireless/rtl8821au/core/crypto' "$WIFI_DST/Makefile"
+          grep -q 'srctree)/drivers/net/wireless/rtl8821au/include' "$WIFI_DST/Makefile" || { echo "ERROR: srctree includes missing" >&2; exit 1; }
+          test -s "$WIFI_DST/include/drv_types.h" || { echo "ERROR: include/drv_types.h missing from driver copy" >&2; exit 1; }
           # Fail-hard guards: driver Kconfig + USB device table + monitor flag.
           grep -q '^config RTL8821AU$' "$WIFI_DST/Kconfig" || { echo "ERROR: config RTL8821AU missing from driver Kconfig" >&2; exit 1; }
           grep -q '0x2357, 0x011F' "$WIFI_DST/os_dep/linux/usb_intf.c" || { echo "ERROR: USB ID 2357:011F missing from usb_intf.c" >&2; exit 1; }

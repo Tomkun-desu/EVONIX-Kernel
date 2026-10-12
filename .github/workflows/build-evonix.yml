@@ -160,10 +160,9 @@ jobs:
           set -euo pipefail
           # Floating SUSFS (Wild-style, single-version): every build resolves
           # the tip of gki-android15-6.6 fresh and applies it onto the runner
-          # copy. The git tree carries NO susfs sources and NO
-          # CONFIG_KSU_SUSFS* in evonix.config (both removed in the same
-          # commit that added this step); hooks come from 50_add, configs
-          # merge ephemerally here. KSU (dev-susfs fork) untouched.
+          # copy. The git tree carries NO susfs sources, NO hooks and NO
+          # CONFIG_KSU_SUSFS* in evonix.config; hooks+configs land
+          # ephemerally here. KSU (dev-susfs fork) untouched.
           # (Same resolve-then-verify pattern as KernelSU-Next above.)
           SUSFS_URL="https://gitlab.com/simonpunk/susfs4ksu.git"
           SUSFS_MIRROR="https://github.com/ShirkNeko/susfs4ksu.git"
@@ -199,22 +198,16 @@ jobs:
           SUSFS_VER="$(grep -m1 '#define SUSFS_VERSION' "$RUNNER_TEMP/susfs4ksu/kernel_patches/include/linux/susfs.h" | awk -F'"' '{print $2}')"
           [ -n "$SUSFS_VER" ] || { echo "ERROR: SUSFS_VERSION not found" >&2; exit 1; }
           echo "susfs_ver=$SUSFS_VER" >> "$GITHUB_OUTPUT"
-          # The git tree carries the hook blocks (kept); the runner copy must
-          # first be stripped back to the pre-image, then the fresh 50_add is
-          # applied. Strip = exact reverse of the same patch file (proved on
-          # scratch: reverse + forward round-trips byte-identical, modulo the
-          # vma rename below). No custom strip script — the patch is its own
-          # inverse, so a newer tip with a different patch fails LOUD here
-          # instead of silently mis-applying.
+          # Fully floating SUSFS: the git tree carries NO susfs hooks (they were
+          # stripped in-tree), so the runner only applies the fresh 50_add
+          # FORWARD onto the pristine copy — no reverse step, nothing to drift.
           # Our tree carries Google's pgsize_migration backport (newer than the
-          # patch pre-image): normalize the renamed symbol before reverse,
+          # patch pre-image): normalize the renamed symbol before apply,
           # same as the reference fake-patch stage (single sed, 6.12-gated
           # there, unconditional here since SUBLEVEL=142 always has it).
           if grep -q 'vma_data_pages' "$WORK_DIR/common/fs/proc/task_mmu.c"; then
             sed -i 's/vma_data_pages/vma_pages/g' "$WORK_DIR/common/fs/proc/task_mmu.c"
           fi
-          git -C "$WORK_DIR/common" apply -R --check "./$SUSFS_PATCH" || exit 1
-          git -C "$WORK_DIR/common" apply -R "./$SUSFS_PATCH"
           git -C "$WORK_DIR/common" apply --check "./$SUSFS_PATCH" || exit 1
           git -C "$WORK_DIR/common" apply "./$SUSFS_PATCH"
           # Restore our tree's pgsize_migration rename on the two pre-existing

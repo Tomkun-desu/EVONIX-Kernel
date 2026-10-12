@@ -163,7 +163,8 @@ jobs:
           # (Same resolve-then-verify pattern as KernelSU-Next above.)
           SUSFS_URL="https://gitlab.com/simonpunk/susfs4ksu.git"
           SUSFS_BRANCH="gki-android15-6.6"
-          SUSFS_TIP="$(git ls-remote "$SUSFS_URL" "refs/heads/$SUSFS_BRANCH" | awk '{print $1; exit}')"
+          SUSFS_TIP=""
+          for i in 1 2 3 4 5; do SUSFS_TIP="$(git ls-remote "$SUSFS_URL" "refs/heads/$SUSFS_BRANCH" | awk '{print $1; exit}' || true)"; [[ "$SUSFS_TIP" =~ ^[0-9a-f]{40}$ ]] && break || { SUSFS_TIP=""; sleep 15; }; done
           [[ "$SUSFS_TIP" =~ ^[0-9a-f]{40}$ ]] || { echo "ERROR: could not resolve SUSFS tip" >&2; exit 1; }
           echo "SUSFS tip: $SUSFS_TIP"
           echo "susfs_commit=$SUSFS_TIP" >> "$GITHUB_OUTPUT"
@@ -1041,7 +1042,7 @@ jobs:
           # SUSFS pin/ver come from the build job outputs (floating tip,
           # resolved at build time); fallback to live tip resolve.
           SUSFS_PIN="${{ needs.build.outputs.susfs_commit }}"
-          [ -n "$SUSFS_PIN" ] || SUSFS_PIN="$(git ls-remote https://gitlab.com/simonpunk/susfs4ksu.git refs/heads/gki-android15-6.6 | awk '{print $1; exit}')"
+          [ -n "$SUSFS_PIN" ] || for i in 1 2 3 4 5; do SUSFS_PIN="$(git ls-remote https://gitlab.com/simonpunk/susfs4ksu.git refs/heads/gki-android15-6.6 | awk '{print $1; exit}' || true)"; [[ "$SUSFS_PIN" =~ ^[0-9a-f]{40}$ ]] && break || { SUSFS_PIN=""; sleep 15; }; done
           SUSFS_VER="${{ needs.build.outputs.susfs_ver }}"
           [ -n "$SUSFS_VER" ] || SUSFS_VER="unknown"
           KEXTRA="$(grep -m1 '^EXTRAVERSION' Makefile | awk '{print $3}')"

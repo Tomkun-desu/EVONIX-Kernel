@@ -523,6 +523,21 @@ jobs:
           grep -qF 'if ((prxattrib->encrypt == _AES_)) {' "$WIFI_DST/core/rtw_security.c" && \
             sed -i 's|if ((prxattrib->encrypt == _AES_)) {|if (prxattrib->encrypt == _AES_) {|' "$WIFI_DST/core/rtw_security.c"
           grep -qF 'if (prxattrib->encrypt == _AES_) {' "$WIFI_DST/core/rtw_security.c" || { echo "ERROR: paren fix missing rtw_security.c#b" >&2; exit 1; }
+          # 6. Multiline parens-equality (same Clang error, EOL-open shape):
+          #    rtl8812a_phycfg.c:1807 — the || continuation is inside
+          #    #if (MP_DRIVER == 1), and our build has MP_DRIVER=0
+          #    (CONFIG_MP_INCLUDED=n), so after preprocessing only
+          #    if ((X)) remains. Drop one paren; other lines untouched.
+          grep -qF 'if ((pHalData->bNeedIQK == _TRUE)' "$WIFI_DST/hal/rtl8812a/rtl8812a_phycfg.c" && \
+            sed -i 's|if ((pHalData->bNeedIQK == _TRUE)|if (pHalData->bNeedIQK == _TRUE)|' "$WIFI_DST/hal/rtl8812a/rtl8812a_phycfg.c"
+          grep -qF 'if (pHalData->bNeedIQK == _TRUE)' "$WIFI_DST/hal/rtl8812a/rtl8812a_phycfg.c" || { echo "ERROR: paren fix missing rtl8812a_phycfg.c" >&2; exit 1; }
+          #    rtw_beamforming.c:1475 — same shape with #ifdef
+          #    CONFIG_80211AC_VHT (defined today, so the && survives and it
+          #    is safe today; fix anyway so a future VHT-off build keeps
+          #    passing instead of costing another 40-minute round trip).
+          grep -qF 'if ((0 == htpriv->beamform_cap)' "$WIFI_DST/core/rtw_beamforming.c" && \
+            sed -i 's|if ((0 == htpriv->beamform_cap)|if (0 == htpriv->beamform_cap)|' "$WIFI_DST/core/rtw_beamforming.c"
+          grep -qF 'if (0 == htpriv->beamform_cap)' "$WIFI_DST/core/rtw_beamforming.c" || { echo "ERROR: paren fix missing rtw_beamforming.c" >&2; exit 1; }
           # Fail-hard guards: driver Kconfig + USB device table + monitor flag.
           grep -q '^config RTL8821AU$' "$WIFI_DST/Kconfig" || { echo "ERROR: config RTL8821AU missing from driver Kconfig" >&2; exit 1; }
           grep -q '0x2357, 0x011F' "$WIFI_DST/os_dep/linux/usb_intf.c" || { echo "ERROR: USB ID 2357:011F missing from usb_intf.c" >&2; exit 1; }

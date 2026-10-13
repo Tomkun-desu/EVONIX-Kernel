@@ -765,6 +765,15 @@ jobs:
           grep -qx 'CONFIG_TCP_CONG_BBR3=y' "$BBR3_CFG" || { echo "ERROR: CONFIG_TCP_CONG_BBR3=y missing from final .config ($BBR3_CFG)" >&2; exit 1; }
           grep -E '^CONFIG_TCP_CONG_BBR' "$BBR3_CFG" || true
           if [ -f "$DIST_DIR/System.map" ]; then grep -q 'bbr3' "$DIST_DIR/System.map" || { echo "ERROR: no bbr3 symbol in System.map" >&2; exit 1; }; fi
+          # WiFi proof hardening: when the dispatch asked for WiFi, assert all
+          # six evonix-wifi.config symbols landed in the final .config
+          # (same BBR3 locate pattern above — reuse $BBR3_CFG).
+          if [ "${{ steps.wifi.outcome }}" = "success" ]; then
+            for WIFI_SYM in CONFIG_WLAN CONFIG_WLAN_VENDOR_REALTEK CONFIG_CFG80211 CONFIG_MAC80211 CONFIG_RFKILL CONFIG_RTL8821AU; do
+              grep -qx "${WIFI_SYM}=y" "$BBR3_CFG" || { echo "ERROR: ${WIFI_SYM}=y missing from final .config ($BBR3_CFG)" >&2; exit 1; }
+            done
+            echo "WiFi final-.config assert: 6/6 symbols present"
+          fi
 
       - name: Save Bazel cache
         if: ${{ always() && (github.event_name != 'workflow_dispatch' || inputs.use_cache) }}
@@ -967,6 +976,7 @@ jobs:
           IN_NTSYNC="${{ inputs.use_ntsync }}"; IN_NTSYNC="${IN_NTSYNC:-false}"
           IN_WIFI="${{ inputs.use_wifi }}"; IN_WIFI="${IN_WIFI:-false}"
           IN_BBG="${{ inputs.use_bbg }}"; IN_BBG="${IN_BBG:-false}"
+          WIFI_OUTCOME="${{ steps.wifi.outcome }}"; WIFI_OUTCOME="${WIFI_OUTCOME:-skipped}"
           STAGE="evonix-artifact"
           rm -rf "$STAGE"; mkdir -p "$STAGE"
           cp -a AnyKernel3/. "$STAGE/"
@@ -988,6 +998,7 @@ jobs:
           - Toolchain: Clang 23.0.1 (android build 16311247, r614150) + ThinLTO + AutoFDO
           - Build date: $BUILD_DATE
           - Inputs: release_type=$IN_REL, use_cache=$IN_CACHE, use_ds=$IN_DS, use_nomount=$IN_NM, use_ntsync=$IN_NTSYNC, use_wifi=$IN_WIFI, use_bbg=$IN_BBG
+          - WiFi proof: IN_WIFI=$IN_WIFI, steps.wifi.outcome=$WIFI_OUTCOME, wifi_commit=${WIFI_PIN:-n/a}
           - kernel.string: $KSTRING
           - Image: $IMG_SIZE bytes, sha256 $IMG_SHA
           - Artifact: $BASE.zip (direct-flashable — AK3 top level + this BuildInfo, no inner zip)

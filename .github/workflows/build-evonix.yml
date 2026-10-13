@@ -563,6 +563,25 @@ jobs:
             sed -i 's|^\tu32 reg_mask;$|\tu32 reg_mask = 0;|' "$WIFI_DST/hal/phydm/phydm_api.c"
           grep -q 'u32 reg_txagc = 0;' "$WIFI_DST/hal/phydm/phydm_api.c" && \
             grep -q 'u32 reg_mask = 0;' "$WIFI_DST/hal/phydm/phydm_api.c" || { echo "ERROR: phydm init missing" >&2; exit 1; }
+          # 8. Builtin-link fix: the driver ships its own AES block-cipher
+          #    copy (aes_encrypt/aes_decrypt + init/deinit in
+          #    core/crypto/aes-internal-enc.c, declared in core/crypto/aes.h)
+          #    under the same global names as lib/crypto/aes.c. As an
+          #    out-of-tree module this never collided; builtin (=y) links
+          #    both into vmlinux and ld.lld dies with 'duplicate symbol:
+          #    aes_encrypt'. Rename the driver-local family to
+          #    rtw_crypto_aes_* (free in both trees; rtw_aes_* stays
+          #    untouched). Word-boundary seds so rtw_aes_encrypt (different
+          #    symbol, different signature) never matches.
+          for AESF in core/crypto/aes.h core/crypto/aes-internal-enc.c core/crypto/aes-ccm.c core/crypto/aes-ctr.c core/crypto/aes-gcm.c core/crypto/aes-omac1.c; do
+            if grep -q '\baes_encrypt\b' "$WIFI_DST/$AESF" || grep -q '\baes_decrypt\b' "$WIFI_DST/$AESF"; then
+              sed -i 's/\<aes_encrypt/rtw_crypto_aes_encrypt/g; s/\<aes_decrypt/rtw_crypto_aes_decrypt/g' "$WIFI_DST/$AESF"
+            fi
+          done
+          grep -q 'rtw_crypto_aes_encrypt_init' "$WIFI_DST/core/crypto/aes.h" || { echo "ERROR: aes rename missing aes.h" >&2; exit 1; }
+          grep -q 'rtw_crypto_aes_encrypt_init' "$WIFI_DST/core/crypto/aes-internal-enc.c" || { echo "ERROR: aes rename missing aes-internal-enc.c" >&2; exit 1; }
+          ! grep -rq '\baes_encrypt\b' "$WIFI_DST/core/crypto/" || { echo "ERROR: bare aes_encrypt remains in driver crypto" >&2; exit 1; }
+          ! grep -rq '\baes_decrypt\b' "$WIFI_DST/core/crypto/" || { echo "ERROR: bare aes_decrypt remains in driver crypto" >&2; exit 1; }
           # Fail-hard guards: driver Kconfig + USB device table + monitor flag.
           grep -q '^config RTL8821AU$' "$WIFI_DST/Kconfig" || { echo "ERROR: config RTL8821AU missing from driver Kconfig" >&2; exit 1; }
           grep -q '0x2357, 0x011F' "$WIFI_DST/os_dep/linux/usb_intf.c" || { echo "ERROR: USB ID 2357:011F missing from usb_intf.c" >&2; exit 1; }

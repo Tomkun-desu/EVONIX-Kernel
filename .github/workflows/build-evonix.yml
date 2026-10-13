@@ -416,8 +416,12 @@ jobs:
           # 2357:011f, already in the driver's usb_intf.c table).
           # Integration happens on the runner workspace copy only; the git
           # tree stays clean (only the evonix-wifi.config fragment is
-          # committed). Builtin (=y) only — a =m module would need
-          # modules.bzl registration + a dist/copy step this workflow lacks.
+          # committed). Modules (=m): the fragment builds the 802.11 stack
+          # + driver as loadable modules so onboard WiFi keeps working (the
+          # AK3 zip ships only Image while vendor_dlkm stays stock) — the
+          # step registers the .kos in modules.bzl and a later gated step
+          # copies them into a separate wifi-modules.zip (manual insmod,
+          # no autoload, never into vendor_dlkm).
           # (Same resolve-then-verify pattern as the steps above.)
           WIFI_COMMIT="$(git ls-remote https://github.com/morrownr/8821au-20210708.git refs/heads/main | awk '{print $1; exit}')"
           [[ "$WIFI_COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "ERROR: could not resolve 8821au tip" >&2; exit 1; }
@@ -597,7 +601,7 @@ jobs:
               ''|'#'*) continue ;;
               '# CONFIG_'*' is not set')
                 SYM="${LINE#'# '}"; SYM="${SYM%' is not set'}"
-                sed -i "/^${SYM}=y$/d" "$WIFI_CONFIG"
+                sed -i "/^${SYM}=[ym]$/d" "$WIFI_CONFIG"
                 grep -qx "$LINE" "$WIFI_CONFIG" || echo "$LINE" >> "$WIFI_CONFIG"
                 ;;
               CONFIG_*'=y')
@@ -605,25 +609,42 @@ jobs:
                 sed -i "/^# ${SYM} is not set$/d" "$WIFI_CONFIG"
                 grep -qx "$LINE" "$WIFI_CONFIG" || echo "$LINE" >> "$WIFI_CONFIG"
                 ;;
+              CONFIG_*'=m')
+                SYM="${LINE%'=m'}"
+                sed -i "/^# ${SYM} is not set$/d" "$WIFI_CONFIG"
+                sed -i "/^${SYM}=y$/d" "$WIFI_CONFIG"
+                grep -qx "$LINE" "$WIFI_CONFIG" || echo "$LINE" >> "$WIFI_CONFIG"
+                ;;
               *) echo "ERROR: unexpected line in evonix-wifi.config: $LINE" >&2; exit 1 ;;
             esac
           done < "$WIFI_FRAG"
-          # Builtin-swallowed modules: the fragment forces RFKILL=y and
-          # MAC80211=y (selects CRYPTO_LIB_ARC4=y), so rfkill and libarc4
-          # link into vmlinux and their .ko files are never emitted — but
-          # modules.bzl still demands them and Kleaf module-staging dies
-          # with 'Unable to find lib/crypto/libarc4.ko' /
-          # 'net/rfkill/rfkill.ko'. Prune both entries on the runner copy
-          # (ephemeral like every other wifi wiring; non-WiFi builds keep
-          # =m and still need them).
+          # Module registration: with the stack as =m, kbuild emits 5 .kos
+          # (kbuild obj layout: net/wireless/Makefile obj-$(CONFIG_CFG80211),
+          # net/mac80211/Makefile obj-$(CONFIG_MAC80211), net/rfkill/Makefile
+          # obj-$(CONFIG_RFKILL), lib/crypto/Makefile
+          # obj-$(CONFIG_CRYPTO_LIB_ARC4) pulled by MAC80211 selects, plus the
+          # driver obj-$(CONFIG_RTL8821AU) := $(MODULE_NAME).o). Register all
+          # 5 in modules.bzl on the runner copy (ephemeral like every other
+          # wifi wiring; non-WiFi builds keep the stock list) so Kleaf stages
+          # them into the dist. Driver .ko name depends on the upstream
+          # Makefile default: MODULE_NAME := 8821au when CONFIG_BT_COEXIST=y
+          # (default y), else 8811au — resolve with a fail-hard guard.
+          if grep -qx 'CONFIG_BT_COEXIST = y' "$WIFI_DST/Makefile"; then
+            WIFI_DRV_KO="8821au.ko"
+          else
+            WIFI_DRV_KO="8811au.ko"
+          fi
+          grep -q "MODULE_NAME := ${WIFI_DRV_KO%.ko}" "$WIFI_DST/Makefile" || { echo "ERROR: MODULE_NAME mismatch for $WIFI_DRV_KO" >&2; exit 1; }
+          echo "Driver module: drivers/net/wireless/rtl8821au/$WIFI_DRV_KO"
           WIFI_MODULES_BZL="$WORK_DIR/common/modules.bzl"
-          grep -q '"lib/crypto/libarc4.ko"' "$WIFI_MODULES_BZL" && \
-            sed -i '/"lib\/crypto\/libarc4.ko",/d' "$WIFI_MODULES_BZL"
-          grep -q '"net/rfkill/rfkill.ko"' "$WIFI_MODULES_BZL" && \
-            sed -i '/"net\/rfkill\/rfkill.ko",/d' "$WIFI_MODULES_BZL"
-          ! grep -q '"lib/crypto/libarc4.ko"' "$WIFI_MODULES_BZL" || { echo "ERROR: libarc4.ko still in modules.bzl" >&2; exit 1; }
-          ! grep -q '"net/rfkill/rfkill.ko"' "$WIFI_MODULES_BZL" || { echo "ERROR: rfkill.ko still in modules.bzl" >&2; exit 1; }
-          echo "modules.bzl builtin prune: OK"
+          grep -qx '    "net/vmw_vsock/vmw_vsock_virtio_transport.ko",' "$WIFI_MODULES_BZL" || { echo "ERROR: modules.bzl anchor entry missing" >&2; exit 1; }
+          for WIFI_KO in "net/wireless/cfg80211.ko" "net/mac80211/mac80211.ko" "net/rfkill/rfkill.ko" "lib/crypto/libarc4.ko" "drivers/net/wireless/rtl8821au/$WIFI_DRV_KO"; do
+            grep -q "\"$WIFI_KO\"" "$WIFI_MODULES_BZL" || \
+              sed -i "s|^    \"net/vmw_vsock/vmw_vsock_virtio_transport.ko\",$|    \"net/vmw_vsock/vmw_vsock_virtio_transport.ko\",\n    \"$WIFI_KO\",|" "$WIFI_MODULES_BZL"
+            grep -q "\"$WIFI_KO\"" "$WIFI_MODULES_BZL" || { echo "ERROR: $WIFI_KO missing from modules.bzl" >&2; exit 1; }
+          done
+          echo "modules.bzl wifi registration: 5/5 entries present"
+          echo "$WIFI_DRV_KO" > "$RUNNER_TEMP/wifi_drv_ko.txt"
           echo "===== WIFI APPLIED ====="
           echo "8821au pinned SHA: $WIFI_COMMIT"
           echo "Driver dir: drivers/net/wireless/rtl8821au/"
@@ -765,15 +786,52 @@ jobs:
           grep -qx 'CONFIG_TCP_CONG_BBR3=y' "$BBR3_CFG" || { echo "ERROR: CONFIG_TCP_CONG_BBR3=y missing from final .config ($BBR3_CFG)" >&2; exit 1; }
           grep -E '^CONFIG_TCP_CONG_BBR' "$BBR3_CFG" || true
           if [ -f "$DIST_DIR/System.map" ]; then grep -q 'bbr3' "$DIST_DIR/System.map" || { echo "ERROR: no bbr3 symbol in System.map" >&2; exit 1; }; fi
-          # WiFi proof hardening: when the dispatch asked for WiFi, assert all
-          # six evonix-wifi.config symbols landed in the final .config
-          # (same BBR3 locate pattern above — reuse $BBR3_CFG).
+          # WiFi proof hardening: when the dispatch asked for WiFi, assert the
+          # evonix-wifi.config symbols landed in the final .config (same
+          # BBR3 locate pattern above — reuse $BBR3_CFG). WLAN pair is
+          # builtin (=y); the 802.11 stack + driver ship as modules (=m).
           if [ "${{ steps.wifi.outcome }}" = "success" ]; then
-            for WIFI_SYM in CONFIG_WLAN CONFIG_WLAN_VENDOR_REALTEK CONFIG_CFG80211 CONFIG_MAC80211 CONFIG_RFKILL CONFIG_RTL8821AU; do
+            for WIFI_SYM in CONFIG_WLAN CONFIG_WLAN_VENDOR_REALTEK; do
               grep -qx "${WIFI_SYM}=y" "$BBR3_CFG" || { echo "ERROR: ${WIFI_SYM}=y missing from final .config ($BBR3_CFG)" >&2; exit 1; }
             done
-            echo "WiFi final-.config assert: 6/6 symbols present"
+            for WIFI_SYM in CONFIG_CFG80211 CONFIG_MAC80211 CONFIG_RFKILL CONFIG_RTL8821AU; do
+              grep -qx "${WIFI_SYM}=m" "$BBR3_CFG" || { echo "ERROR: ${WIFI_SYM}=m missing from final .config ($BBR3_CFG)" >&2; exit 1; }
+            done
+            echo "WiFi final-.config assert: 2/2 =y + 4/4 =m symbols present"
           fi
+
+      - name: Collect WiFi modules (optional, dispatch only)
+        id: wifi-modules
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.use_wifi && steps.wifi.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          # The wifi step registered 5 .kos in modules.bzl, so Kleaf staged
+          # them into DIST_DIR (flat layout, same as the 95/97-ko listing the
+          # Verify step prints). Collect them into a separate wifi-modules.zip
+          # — NOT into vendor_dlkm (stays stock), NOT into modules.load
+          # (no autoload; the user insmods manually in dependency order).
+          WIFI_DRV_KO="8821au.ko"
+          if [ -f "$RUNNER_TEMP/wifi_drv_ko.txt" ]; then WIFI_DRV_KO="$(cat "$RUNNER_TEMP/wifi_drv_ko.txt")"; fi
+          case "$WIFI_DRV_KO" in 8821au.ko|8811au.ko) ;; *) echo "ERROR: unexpected driver ko: $WIFI_DRV_KO" >&2; exit 1 ;; esac
+          WIFI_STAGE="$RUNNER_TEMP/wifi-modules"
+          rm -rf "$WIFI_STAGE"; mkdir -p "$WIFI_STAGE"
+          for KO in cfg80211.ko mac80211.ko rfkill.ko libarc4.ko "$WIFI_DRV_KO"; do
+            COUNT="$(find "$DIST_DIR" -name "$KO" -type f | wc -l)"
+            [ "$COUNT" -eq 1 ] || { echo "ERROR: expected 1 $KO in DIST_DIR, found $COUNT" >&2; exit 1; }
+            find "$DIST_DIR" -name "$KO" -type f -exec cp -a {} "$WIFI_STAGE/" \;
+            test -s "$WIFI_STAGE/$KO" || { echo "ERROR: $KO copy failed" >&2; exit 1; }
+            echo "staged: $KO"
+          done
+          ls -la "$WIFI_STAGE"
+          ( cd "$WIFI_STAGE" && sha256sum ./*.ko | tee modules.sha256 )
+          ( cd "$WIFI_STAGE" && zip -q -9 "$GITHUB_WORKSPACE/wifi-modules.zip" ./*.ko modules.sha256 )
+          test -s "$GITHUB_WORKSPACE/wifi-modules.zip"
+          unzip -l "$GITHUB_WORKSPACE/wifi-modules.zip"
+          echo "===== WIFI MODULES COLLECTED ====="
+          echo "driver: $WIFI_DRV_KO (wlan1, NOT wlan0 — onboard owns wlan0)"
+          echo "insmod order: rfkill.ko libarc4.ko cfg80211.ko mac80211.ko $WIFI_DRV_KO"
+          echo "bring-up: ip link set wlan1 up (IPS/LPS gate RF until up)"
+          echo "===== END WIFI MODULES COLLECTED ====="
 
       - name: Save Bazel cache
         if: ${{ always() && (github.event_name != 'workflow_dispatch' || inputs.use_cache) }}
@@ -1043,6 +1101,15 @@ jobs:
         with:
           name: ${{ env.ARTIFACT_NAME }}
           path: ${{ github.workspace }}/evonix-artifact/
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Upload WiFi modules (optional, dispatch only)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.use_wifi && steps.wifi-modules.outcome == 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}-wifi-modules
+          path: ${{ github.workspace }}/wifi-modules.zip
           if-no-files-found: error
           compression-level: 0
 

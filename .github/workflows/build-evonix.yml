@@ -980,6 +980,73 @@ jobs:
           if grep -q 'init\.tuna\|fstab\.tuna\|maguro\|toro\|tuna\|device\.name[0-9]*=[^[:space:]]' AnyKernel3/anykernel.sh; then echo "ERROR: tuna template remnant in anykernel.sh" >&2; exit 1; fi
           if grep -q '^dump_boot' AnyKernel3/anykernel.sh; then echo "ERROR: dump_boot remnant in anykernel.sh" >&2; exit 1; fi
           if grep -q '^boot_attributes' AnyKernel3/anykernel.sh; then echo "ERROR: boot_attributes remnant in anykernel.sh" >&2; exit 1; fi
+          # WiFi in-zip payload (single-file promise): when the Collect step
+          # ran (dispatch ON build), stage its 5 .kos + modules.sha256 as
+          # AnyKernel3/wifi-modules/ and append a BEST-EFFORT copy block to
+          # anykernel.sh. boot.img stays kernel-only (GKI split_boot, vendor
+          # ramdisk untouched); do.modules stays 0 (/system is EROFS on
+          # rodin), so the block targets /data/local/tmp/evonix-wifi and can
+          # never abort the flash (boot is already written when it runs).
+          WIFI_BUNDLED=false
+          WIFI_DRV_KO="8821au.ko"
+          if [ -f "$RUNNER_TEMP/wifi_drv_ko.txt" ]; then WIFI_DRV_KO="$(cat "$RUNNER_TEMP/wifi_drv_ko.txt")"; fi
+          case "$WIFI_DRV_KO" in 8821au.ko|8811au.ko) ;; *) echo "ERROR: unexpected driver ko: $WIFI_DRV_KO" >&2; exit 1 ;; esac
+          WIFI_BUNDLE_STATUS="absent (WiFi not requested — zip is kernel-only Image)"
+          WIFI_BUNDLE_SHORT="absent"
+          if [ -s "$GITHUB_WORKSPACE/wifi-modules.zip" ] || [ -d "$RUNNER_TEMP/wifi-modules" ]; then
+            WIFI_SRC="$RUNNER_TEMP/wifi-modules"
+            if [ ! -d "$WIFI_SRC" ]; then
+              WIFI_SRC="$RUNNER_TEMP/wifi-from-zip"
+              rm -rf "$WIFI_SRC"; mkdir -p "$WIFI_SRC"
+              unzip -q -o "$GITHUB_WORKSPACE/wifi-modules.zip" -d "$WIFI_SRC"
+            fi
+            grep -qx '## end boot install' AnyKernel3/anykernel.sh
+            mkdir -p AnyKernel3/wifi-modules
+            for KO in cfg80211.ko mac80211.ko rfkill.ko libarc4.ko "$WIFI_DRV_KO" modules.sha256; do
+              test -s "$WIFI_SRC/$KO" || { echo "ERROR: wifi payload missing: $WIFI_SRC/$KO" >&2; exit 1; }
+              cp -a "$WIFI_SRC/$KO" AnyKernel3/wifi-modules/
+            done
+            ( cd AnyKernel3/wifi-modules && sha256sum -c modules.sha256 ) || { echo "ERROR: wifi payload sha256 mismatch" >&2; exit 1; }
+            ls -la AnyKernel3/wifi-modules
+            cat >> AnyKernel3/anykernel.sh <<'WIFIEOF'
+          # EVONIX WiFi modules (bundled payload — best-effort, never aborts:
+          # the boot.img above is already flashed when this runs).
+          if [ -d "$AKHOME/wifi-modules" ]; then
+            ui_print " " "  -> EVONIX WiFi modules found, staging to /data/local/tmp/evonix-wifi";
+            if mkdir -p /data/local/tmp/evonix-wifi 2>/dev/null; then
+              WIFI_OK=true;
+              for KO in rfkill.ko libarc4.ko cfg80211.ko mac80211.ko 8821au.ko 8811au.ko modules.sha256; do
+                if [ -f "$AKHOME/wifi-modules/$KO" ]; then
+                  cp -af "$AKHOME/wifi-modules/$KO" /data/local/tmp/evonix-wifi/ 2>/dev/null || WIFI_OK=false;
+                fi;
+              done;
+              chmod 644 /data/local/tmp/evonix-wifi/*.ko 2>/dev/null || WIFI_OK=false;
+              if [ "$WIFI_OK" = true ]; then
+                ui_print "  -> staged: insmod rfkill libarc4 cfg80211 mac80211 8821au/8811au, then: ip link set wlan1 up";
+              else
+                ui_print "  -> staging incomplete (boot is flashed) — push wifi-modules manually via adb";
+              fi;
+              unset WIFI_OK KO;
+            else
+              ui_print "  -> /data not writable (boot is flashed) — push wifi-modules manually via adb";
+            fi;
+          fi;
+          WIFIEOF
+            grep -qF 'evonix-wifi' AnyKernel3/anykernel.sh
+            grep -qx 'do.modules=0' AnyKernel3/anykernel.sh
+            WIFI_BUNDLED=true
+            WIFI_BUNDLE_STATUS="bundled (wifi-modules/: 5 .ko + modules.sha256 -> /data/local/tmp/evonix-wifi; insmod rfkill libarc4 cfg80211 mac80211 $WIFI_DRV_KO; wlan1, ip link set wlan1 up)"
+            WIFI_BUNDLE_SHORT="bundled"
+            echo "===== WIFI MODULES BUNDLED INTO AK3 ZIP ====="
+            echo "driver: $WIFI_DRV_KO (wlan1, NOT wlan0 — onboard owns wlan0)"
+            echo "payload: AnyKernel3/wifi-modules/ (5 .ko + modules.sha256)"
+            echo "copy destination: /data/local/tmp/evonix-wifi (best-effort, never aborts)"
+            echo "insmod order: rfkill.ko libarc4.ko cfg80211.ko mac80211.ko $WIFI_DRV_KO"
+            echo "bring-up: ip link set wlan1 up (IPS/LPS gate RF until up)"
+            echo "===== END WIFI MODULES BUNDLED ====="
+          else
+            echo "WiFi not requested — AK3 zip unchanged (kernel-only Image, no wifi-modules/)"
+          fi
           # Direct-flashable staging: the artifact itself IS the flashable tree.
           # upload-artifact re-zips `path`, so STAGE holds the AK3 layout at
           # top level (META-INF/anykernel.sh/Image/banner) plus the BuildInfo
@@ -1050,6 +1117,7 @@ jobs:
           - NoMount: $NM_STATUS
           - NTSync: $NTSYNC_STATUS
           - RTL8821AU WiFi: $WIFI_STATUS
+          - WiFi bundle: $WIFI_BUNDLE_STATUS
           - Baseband-Guard: $BBG_STATUS
           - AnyKernel3: $AK3_COMMIT (master @ osm0sis/AnyKernel3)
           - AnyKernel3 tools: $AK3_TOOLS_COMMIT (arm64-tools @ osm0sis/AnyKernel3, AArch64)
@@ -1069,6 +1137,17 @@ jobs:
           for ENTRY in 'META-INF/' 'anykernel.sh' 'Image' 'banner' "BuildInfo-$BASE.md" 'Image.sha256'; do
             grep -q "$ENTRY" <<<"$ZIP_LIST" || { echo "ERROR: staged artifact missing entry: $ENTRY" >&2; exit 1; }
           done
+          if [ "$WIFI_BUNDLED" = true ]; then
+            for WENTRY in 'wifi-modules/' 'wifi-modules/8821au.ko' 'wifi-modules/8811au.ko' 'wifi-modules/cfg80211.ko' 'wifi-modules/mac80211.ko' 'wifi-modules/rfkill.ko' 'wifi-modules/libarc4.ko' 'wifi-modules/modules.sha256'; do
+              case "$WENTRY" in
+                "wifi-modules/$WIFI_DRV_KO") ;;
+                'wifi-modules/8821au.ko'|'wifi-modules/8811au.ko') continue ;;
+              esac
+              grep -q "$WENTRY" <<<"$ZIP_LIST" || { echo "ERROR: staged artifact missing wifi entry: $WENTRY" >&2; exit 1; }
+            done
+          else
+            if grep -q 'wifi-modules/' <<<"$ZIP_LIST"; then echo "ERROR: unexpected wifi-modules/ in OFF/push build" >&2; exit 1; fi
+          fi
           rm -f "_verify_$BASE.zip"
           # English-only build summary: config matrix → artifact result.
           {
@@ -1087,7 +1166,7 @@ jobs:
             echo "| Droidspaces | \`$DS_STATUS\` |"
             echo "| NoMount | \`$NM_STATUS\` |"
             echo "| NTSync | \`$NTSYNC_STATUS\` |"
-            echo "| RTL8821AU WiFi | \`$WIFI_STATUS\` |"
+            echo "| RTL8821AU WiFi | \`$WIFI_STATUS / bundle: $WIFI_BUNDLE_SHORT\` |"
             echo "| Baseband-Guard | \`$BBG_STATUS\` |"
             echo "| AnyKernel3 | \`${AK3_COMMIT:-n/a}\` |"
             if [ "$IN_BBG" = "true" ]; then
@@ -1101,15 +1180,6 @@ jobs:
         with:
           name: ${{ env.ARTIFACT_NAME }}
           path: ${{ github.workspace }}/evonix-artifact/
-          if-no-files-found: error
-          compression-level: 0
-
-      - name: Upload WiFi modules (optional, dispatch only)
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.use_wifi && steps.wifi-modules.outcome == 'success' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.ARTIFACT_NAME }}-wifi-modules
-          path: ${{ github.workspace }}/wifi-modules.zip
           if-no-files-found: error
           compression-level: 0
 

@@ -19,7 +19,7 @@ die() {
 }
 
 echo "============================================"
-echo " EVONIX Kernel Build"
+echo " EVONIX V4.5 Kernel Build"
 echo " Linux 6.6.142"
 echo " Clang 23 + ThinLTO + AutoFDO"
 echo "============================================"
@@ -136,20 +136,13 @@ echo "===== VERIFY OUTPUT ====="
 [[ -f "$DIST/vmlinux" ]] ||
     die "Build completed without vmlinux in the dist directory."
 
-CFG="$(
-    find "$WORKSPACE/out/bazel/output_user_root" \
-        -path '*kernel_aarch64_config/out_dir/.config' \
-        -type f \
-        -printf '%T@ %p\n' 2>/dev/null |
-    sort -nr |
-    head -n 1 |
-    cut -d' ' -f2-
-)"
+# Validate the Image being delivered, not a potentially stale or concurrent
+# build's configuration selected by output-directory modification time.
+CFG="$DIST/embedded.config"
+"$COMMON_DIR/scripts/extract-ikconfig" "$DIST/Image" > "$CFG" ||
+    die "Could not extract the built Image configuration."
 
-[[ -n "$CFG" && -f "$CFG" ]] ||
-    die "Could not locate generated kernel .config."
-
-echo "Generated config: $CFG"
+echo "Embedded Image config: $CFG"
 echo
 
 for option in \
@@ -160,14 +153,24 @@ for option in \
     CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE=y \
     CONFIG_ARM64_TUNE_CORTEX_A725=y \
     CONFIG_EVONIX_RODIN_SCHED_SLICE_US=500 \
+    CONFIG_EVONIX_RODIN_UI_WAKEUP=y \
+    CONFIG_EVONIX_RODIN_SHORT_SLICE=y \
     CONFIG_NR_CPUS=32 \
     CONFIG_WQ_POWER_EFFICIENT_DEFAULT=y \
+    CONFIG_EVONIX_RODIN_PM_WQ=y \
+    CONFIG_NO_HZ_IDLE=y \
     CONFIG_RCU_LAZY=y \
     CONFIG_KFENCE_DEFERRABLE=y
 do
     grep -qx "$option" "$CFG" ||
         die "Final kernel config is missing: $option"
 done
+
+[[ -f "$DIST/modules.builtin" ]] ||
+    die "Build completed without modules.builtin."
+if grep -Eq '(^|/)(zram|zsmalloc)\.ko$' "$DIST/modules.builtin"; then
+    die "ROM-owned compressed-swap drivers unexpectedly built into Image."
+fi
 
 if grep -qx 'CONFIG_LTO_NONE=y' "$CFG"; then
     die "Final kernel unexpectedly contains CONFIG_LTO_NONE=y."

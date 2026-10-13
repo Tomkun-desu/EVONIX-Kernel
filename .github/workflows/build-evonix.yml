@@ -608,6 +608,22 @@ jobs:
               *) echo "ERROR: unexpected line in evonix-wifi.config: $LINE" >&2; exit 1 ;;
             esac
           done < "$WIFI_FRAG"
+          # Builtin-swallowed modules: the fragment forces RFKILL=y and
+          # MAC80211=y (selects CRYPTO_LIB_ARC4=y), so rfkill and libarc4
+          # link into vmlinux and their .ko files are never emitted — but
+          # modules.bzl still demands them and Kleaf module-staging dies
+          # with 'Unable to find lib/crypto/libarc4.ko' /
+          # 'net/rfkill/rfkill.ko'. Prune both entries on the runner copy
+          # (ephemeral like every other wifi wiring; non-WiFi builds keep
+          # =m and still need them).
+          WIFI_MODULES_BZL="$WORK_DIR/common/modules.bzl"
+          grep -q '"lib/crypto/libarc4.ko"' "$WIFI_MODULES_BZL" && \
+            sed -i '/"lib\/crypto\/libarc4.ko",/d' "$WIFI_MODULES_BZL"
+          grep -q '"net/rfkill/rfkill.ko"' "$WIFI_MODULES_BZL" && \
+            sed -i '/"net\/rfkill\/rfkill.ko",/d' "$WIFI_MODULES_BZL"
+          ! grep -q '"lib/crypto/libarc4.ko"' "$WIFI_MODULES_BZL" || { echo "ERROR: libarc4.ko still in modules.bzl" >&2; exit 1; }
+          ! grep -q '"net/rfkill/rfkill.ko"' "$WIFI_MODULES_BZL" || { echo "ERROR: rfkill.ko still in modules.bzl" >&2; exit 1; }
+          echo "modules.bzl builtin prune: OK"
           echo "===== WIFI APPLIED ====="
           echo "8821au pinned SHA: $WIFI_COMMIT"
           echo "Driver dir: drivers/net/wireless/rtl8821au/"

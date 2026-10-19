@@ -42,6 +42,10 @@ on:
         description: "Baseband-Guard LSM + CONFIG_BBG (generic allowlist until rodin validated)"
         type: boolean
         default: false
+      susfs_pin:
+        description: "SUSFS pin (40-char sha). Empty = floating tip of gki-android15-6.6"
+        type: string
+        default: ""
   push:
     branches:
       - coloros/ksu-susfs
@@ -63,6 +67,7 @@ jobs:
       ksu_sha: ${{ steps.ksu-latest.outputs.ksu_sha }}
       susfs_commit: ${{ steps.susfs.outputs.susfs_commit }}
       susfs_ver: ${{ steps.susfs.outputs.susfs_ver }}
+      susfs_fallback: ${{ steps.susfs.outputs.susfs_fallback }}
       ds_commit: ${{ steps.ds.outputs.ds_commit }}
       nm_commit: ${{ steps.nm.outputs.nm_commit }}
       ntsync_commit: ${{ steps.ntsync.outputs.ntsync_commit }}
@@ -156,6 +161,10 @@ jobs:
 
       - name: Apply SUSFS floating (tip of gki-android15-6.6)
         id: susfs
+        env:
+          # Dispatch override (empty on push -> floating tip).
+          SUSFS_PIN_INPUT: ${{ inputs.susfs_pin }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           # Floating SUSFS (Wild-style, single-version): every build resolves
@@ -168,48 +177,125 @@ jobs:
           SUSFS_MIRROR="https://github.com/ShirkNeko/susfs4ksu.git"
           SUSFS_BRANCH="gki-android15-6.6"
           SUSFS_TIP=""
-          for remote in "$SUSFS_URL" "$SUSFS_MIRROR"; do
-            for i in 1 2 3 4 5; do SUSFS_TIP="$(git ls-remote "$remote" "refs/heads/$SUSFS_BRANCH" | awk '{print $1; exit}' || true)"; [[ "$SUSFS_TIP" =~ ^[0-9a-f]{40}$ ]] && break || { SUSFS_TIP=""; sleep 15; }; done
-            if [[ "$SUSFS_TIP" =~ ^[0-9a-f]{40}$ ]]; then SUSFS_URL="$remote"; break; fi
-          done
+          # Optional dispatch override: force a known-good sha (empty on push).
+          if [ -n "${SUSFS_PIN_INPUT:-}" ]; then
+            [[ "$SUSFS_PIN_INPUT" =~ ^[0-9a-f]{40}$ ]] || { echo "ERROR: susfs_pin must be a 40-char sha" >&2; exit 1; }
+            SUSFS_TIP="$SUSFS_PIN_INPUT"
+            echo "SUSFS pin forced by dispatch input: $SUSFS_TIP"
+          fi
+          if [ -z "$SUSFS_TIP" ]; then
+            for remote in "$SUSFS_URL" "$SUSFS_MIRROR"; do
+              for i in 1 2 3 4 5; do SUSFS_TIP="$(git ls-remote "$remote" "refs/heads/$SUSFS_BRANCH" | awk '{print $1; exit}' || true)"; [[ "$SUSFS_TIP" =~ ^[0-9a-f]{40}$ ]] && break || { SUSFS_TIP=""; sleep 15; }; done
+              if [[ "$SUSFS_TIP" =~ ^[0-9a-f]{40}$ ]]; then SUSFS_URL="$remote"; break; fi
+            done
+          fi
           [[ "$SUSFS_TIP" =~ ^[0-9a-f]{40}$ ]] || { echo "ERROR: could not resolve SUSFS tip" >&2; exit 1; }
           [ "$SUSFS_URL" = "$SUSFS_MIRROR" ] && echo "WARNING: GitLab unreachable, building SUSFS from GitHub mirror ($SUSFS_MIRROR)" >&2
           echo "SUSFS tip: $SUSFS_TIP"
-          echo "susfs_commit=$SUSFS_TIP" >> "$GITHUB_OUTPUT"
-          for i in 1 2 3 4 5; do rm -rf "${RUNNER_TEMP:?}/susfs4ksu"; git clone --depth=1 -b "$SUSFS_BRANCH" "$SUSFS_URL" "$RUNNER_TEMP/susfs4ksu" && break || sleep 5; done
-          [ -d "$RUNNER_TEMP/susfs4ksu/.git" ] || { echo "ERROR: susfs4ksu clone failed" >&2; exit 1; }
-          for i in 1 2 3; do git -C "$RUNNER_TEMP/susfs4ksu" fetch --depth=1 origin "$SUSFS_TIP" && git -C "$RUNNER_TEMP/susfs4ksu" checkout "$SUSFS_TIP" && break || { [ "$i" -eq 3 ] && exit 1; sleep 10; }; done
-          [ "$(git -C "$RUNNER_TEMP/susfs4ksu" rev-parse HEAD)" = "$SUSFS_TIP" ] || { echo "SUSFS pin mismatch" >&2; exit 1; }
+          # ---- staging: exact pin + sources + version (reused by the fallback)
+          ensure_susfs_pin() {
+            local pin="$1" remote i
+            for remote in "$SUSFS_URL" "$SUSFS_MIRROR"; do
+              if [ ! -d "$RUNNER_TEMP/susfs4ksu/.git" ]; then
+                for i in 1 2 3 4 5; do rm -rf "${RUNNER_TEMP:?}/susfs4ksu"; git clone --depth=1 -b "$SUSFS_BRANCH" "$remote" "$RUNNER_TEMP/susfs4ksu" && break || sleep 5; done
+              fi
+              [ -d "$RUNNER_TEMP/susfs4ksu/.git" ] || continue
+              for i in 1 2 3; do git -C "$RUNNER_TEMP/susfs4ksu" fetch --depth=1 origin "$pin" >/dev/null 2>&1 && git -C "$RUNNER_TEMP/susfs4ksu" checkout -q "$pin" >/dev/null 2>&1 && break || sleep 10; done
+              if [ "$(git -C "$RUNNER_TEMP/susfs4ksu" rev-parse HEAD 2>/dev/null || true)" = "$pin" ]; then return 0; fi
+              rm -rf "${RUNNER_TEMP:?}/susfs4ksu"
+            done
+            return 1
+          }
+          stage_susfs() {
+            local pin="$1"
+            ensure_susfs_pin "$pin" || { echo "ERROR: could not fetch SUSFS pin $pin from GitLab or the mirror" >&2; return 1; }
+            # Drop whatever a previous attempt staged, so the fallback pin lands
+            # on a clean tree. The tree carries no susfs sources of its own
+            # (verified floating), so anything matching here came from us.
+            rm -f "$WORK_DIR/common/fs/susfs.c" "$WORK_DIR/common/include/linux/susfs.h" \
+                  "$WORK_DIR/common/include/linux/susfs_def.h" "$WORK_DIR/common/"50_add_susfs_in_*.patch
+            # Resolve the 50_add patch by glob (exactly one must match): survives
+            # an upstream rename, fails LOUD on zero/multiple matches.
+            SUSFS_PATCH_CANDIDATES=( "$RUNNER_TEMP"/susfs4ksu/kernel_patches/50_add_susfs_in_*.patch )
+            [ "${#SUSFS_PATCH_CANDIDATES[@]}" -eq 1 ] || { echo "ERROR: expected exactly one 50_add_susfs patch, found ${#SUSFS_PATCH_CANDIDATES[@]} at $pin" >&2; return 1; }
+            SUSFS_PATCH="$(basename "${SUSFS_PATCH_CANDIDATES[0]}")"
+            cp -f "$RUNNER_TEMP/susfs4ksu/kernel_patches/fs/"* "$WORK_DIR/common/fs/"
+            cp -f "$RUNNER_TEMP/susfs4ksu/kernel_patches/include/linux/"* "$WORK_DIR/common/include/linux/"
+            cp -f "$RUNNER_TEMP/susfs4ksu/kernel_patches/$SUSFS_PATCH" "$WORK_DIR/common/"
+            SUSFS_VER="$(grep -m1 '#define SUSFS_VERSION' "$RUNNER_TEMP/susfs4ksu/kernel_patches/include/linux/susfs.h" | awk -F'"' '{print $2}')"
+            [ -n "$SUSFS_VER" ] || { echo "ERROR: SUSFS_VERSION not found at $pin" >&2; return 1; }
+            echo "SUSFS patch file: $SUSFS_PATCH"
+            echo "SUSFS_VERSION at ${pin:0:12}: $SUSFS_VER"
+          }
+          stage_susfs "$SUSFS_TIP" || exit 1
+          SUSFS_STAGED="$SUSFS_TIP"
           # If upstream lands a commit between ls-remote and fetch, this build
-          # pins the resolved TIP (at most one commit behind) and warns; the
-          # pin is recorded in the susfs_commit output.
+          # pins the resolved TIP (at most one commit behind) and warns.
           SUSFS_TIP2="$(git ls-remote "$SUSFS_URL" "refs/heads/$SUSFS_BRANCH" | awk '{print $1; exit}' || true)"
           if [ -n "${SUSFS_TIP2:-}" ] && [ "$SUSFS_TIP2" != "$SUSFS_TIP" ]; then echo "WARNING: SUSFS tip moved during fetch ($SUSFS_TIP -> $SUSFS_TIP2); building pinned $SUSFS_TIP" >&2; fi
-          # Resolve the 50_add patch by glob (exactly one must match): survives
-          # an upstream rename, fails LOUD on zero/multiple matches.
-          SUSFS_PATCH_CANDIDATES=( "$RUNNER_TEMP"/susfs4ksu/kernel_patches/50_add_susfs_in_*.patch )
-          [ "${#SUSFS_PATCH_CANDIDATES[@]}" -eq 1 ] || { echo "ERROR: expected exactly one 50_add_susfs patch, found ${#SUSFS_PATCH_CANDIDATES[@]}" >&2; exit 1; }
-          SUSFS_PATCH="$(basename "${SUSFS_PATCH_CANDIDATES[0]}")"
-          test -f "$RUNNER_TEMP/susfs4ksu/kernel_patches/$SUSFS_PATCH"
-          echo "SUSFS patch file: $SUSFS_PATCH"
-          cp "$RUNNER_TEMP/susfs4ksu/kernel_patches/fs/"* "$WORK_DIR/common/fs/"
-          cp "$RUNNER_TEMP/susfs4ksu/kernel_patches/include/linux/"* "$WORK_DIR/common/include/linux/"
-          cp "$RUNNER_TEMP/susfs4ksu/kernel_patches/$SUSFS_PATCH" "$WORK_DIR/common/"
-          SUSFS_VER="$(grep -m1 '#define SUSFS_VERSION' "$RUNNER_TEMP/susfs4ksu/kernel_patches/include/linux/susfs.h" | awk -F'"' '{print $2}')"
-          [ -n "$SUSFS_VER" ] || { echo "ERROR: SUSFS_VERSION not found" >&2; exit 1; }
-          echo "susfs_ver=$SUSFS_VER" >> "$GITHUB_OUTPUT"
+          # ---- apply: pristine first, symbol-normalized only as a second try
           # Fully floating SUSFS: the git tree carries NO susfs hooks (they were
           # stripped in-tree), so the runner only applies the fresh 50_add
-          # FORWARD onto the pristine copy — no reverse step, nothing to drift.
-          # Our tree carries Google's pgsize_migration backport (newer than the
-          # patch pre-image): normalize the renamed symbol before apply,
-          # same as the reference fake-patch stage (single sed, 6.12-gated
-          # there, unconditional here since SUBLEVEL=142 always has it).
-          if grep -q 'vma_data_pages' "$WORK_DIR/common/fs/proc/task_mmu.c"; then
-            sed -i 's/vma_data_pages/vma_pages/g' "$WORK_DIR/common/fs/proc/task_mmu.c"
+          # FORWARD onto the pristine copy - no reverse step, nothing to drift.
+          # The patch's task_mmu.c context follows the base upstream last
+          # rebased onto: after "rebase susfs patches onto android15-6.6.143"
+          # it expects Google's pgsize_migration rename (vma_data_pages), which
+          # our tree already carries; before that it expected vma_pages. So the
+          # pristine file is tried FIRST and the symbol is only rewritten when
+          # this tip actually wants it - an unconditional sed breaks the hunk
+          # at fs/proc/task_mmu.c:1040 on the current tip.
+          TASK_MMU="$WORK_DIR/common/fs/proc/task_mmu.c"
+          apply_susfs() {
+            git -C "$WORK_DIR/common" apply --check "./$SUSFS_PATCH" 2>"$RUNNER_TEMP/susfs-apply.err" \
+              && git -C "$WORK_DIR/common" apply "./$SUSFS_PATCH"
+          }
+          apply_susfs_adaptive() {
+            apply_susfs && return 0
+            echo "WARNING: $SUSFS_PATCH does not apply to the pristine tree:" >&2
+            cat "$RUNNER_TEMP/susfs-apply.err" >&2 || true
+            grep -q 'vma_data_pages' "$TASK_MMU" || return 1
+            echo "Retrying with the pgsize_migration symbol normalization (vma_data_pages -> vma_pages)..." >&2
+            sed -i 's/vma_data_pages/vma_pages/g' "$TASK_MMU"
+            if apply_susfs; then return 0; fi
+            cat "$RUNNER_TEMP/susfs-apply.err" >&2 || true
+            return 1
+          }
+          # Last known-good pin = the SUSFS pin stamped into BuildInfo by the
+          # newest release of THIS branch. Read-only, no extra secrets, and it
+          # can only ever offer a pin that already built once.
+          last_good_susfs_pin() {
+            local tag url pin
+            tag="$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=30" \
+                     --jq "[.[] | select(.name | contains(\"($GITHUB_REF_NAME)\"))][0].tag_name" 2>/dev/null || true)"
+            [ -n "$tag" ] && [ "$tag" != "null" ] || return 1
+            url="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" \
+                     --jq '[.assets[] | select(.name | startswith("BuildInfo"))][0].url' 2>/dev/null || true)"
+            [ -n "$url" ] && [ "$url" != "null" ] || return 1
+            pin="$(gh api -H "Accept: application/octet-stream" "$url" 2>/dev/null | awk '/^- SUSFS:/ {print; exit}' | grep -oE '[0-9a-f]{40}' | head -1 || true)"
+            [[ "$pin" =~ ^[0-9a-f]{40}$ ]] || return 1
+            printf '%s' "$pin"
+          }
+          SUSFS_PIN_USED="$SUSFS_TIP"
+          SUSFS_FALLBACK="false"
+          if ! apply_susfs_adaptive; then
+            echo "ERROR: SUSFS tip $SUSFS_TIP cannot be applied to this tree" >&2
+            git -C "$WORK_DIR/common" checkout -- fs/proc/task_mmu.c 2>/dev/null || true
+            LAST_GOOD="$(last_good_susfs_pin || true)"
+            if [ -n "${LAST_GOOD:-}" ] && [ "$LAST_GOOD" != "$SUSFS_TIP" ]; then
+              echo "WARNING: falling back to the last known-good SUSFS pin $LAST_GOOD (newest release of $GITHUB_REF_NAME)" >&2
+              stage_susfs "$LAST_GOOD" || { echo "ERROR: could not stage the fallback pin $LAST_GOOD" >&2; exit 1; }
+              apply_susfs_adaptive || { echo "ERROR: fallback pin $LAST_GOOD does not apply either; refusing to ship an unpatched kernel" >&2; exit 1; }
+              SUSFS_PIN_USED="$LAST_GOOD"
+              SUSFS_FALLBACK="true"
+            else
+              echo "ERROR: no last known-good SUSFS pin available for $GITHUB_REF_NAME; pass susfs_pin or wait for upstream to fix the tip" >&2
+              exit 1
+            fi
           fi
-          git -C "$WORK_DIR/common" apply --check "./$SUSFS_PATCH" || exit 1
-          git -C "$WORK_DIR/common" apply "./$SUSFS_PATCH"
+          echo "susfs_commit=$SUSFS_PIN_USED" >> "$GITHUB_OUTPUT"
+          echo "susfs_ver=$SUSFS_VER" >> "$GITHUB_OUTPUT"
+          echo "susfs_fallback=$SUSFS_FALLBACK" >> "$GITHUB_OUTPUT"
+          echo "SUSFS pin used: $SUSFS_PIN_USED (staged tip was $SUSFS_STAGED, fallback=$SUSFS_FALLBACK)"
           # Restore our tree's pgsize_migration rename on the two pre-existing
           # call sites only. Guarded to the exact stock context lines so a
           # future floating patch that adds its own `if (vma_pages(vma))` is
@@ -1076,6 +1162,12 @@ jobs:
           [ -n "$SUSFS_PIN" ] || { echo "ERROR: SUSFS_PIN is empty (susfs_commit missing)" >&2; exit 1; }
           SUSFS_VER="${{ steps.susfs.outputs.susfs_ver }}"
           [ -n "$SUSFS_VER" ] || { echo "ERROR: SUSFS_VER is empty (susfs_ver missing)" >&2; exit 1; }
+          SUSFS_FALLBACK="${{ steps.susfs.outputs.susfs_fallback }}"
+          if [ "$SUSFS_FALLBACK" = "true" ]; then
+            SUSFS_NOTE="$SUSFS_VER ($SUSFS_PIN, last known-good fallback: the gki-android15-6.6 tip did not apply)"
+          else
+            SUSFS_NOTE="$SUSFS_VER ($SUSFS_PIN, floating gki-android15-6.6 tip @ simonpunk/susfs4ksu)"
+          fi
           DS_STATUS="disabled"; [ -n "$DS_PIN" ] || DS_PIN="n/a"
           if [ "${DS_PIN}" != "n/a" ]; then DS_STATUS="enabled ($DS_PIN)"; fi
           NM_STATUS="disabled"; [ -n "$NM_PIN" ] || NM_PIN="n/a"
@@ -1112,7 +1204,7 @@ jobs:
           - Commit: $GITHUB_SHA (short: $SHORT_SHA)
           - Kernel: 6.6.$KVER ($KEXTRA)
           - KernelSU-Next: $KSU_PIN (dev-susfs @ pershoot/KernelSU-Next)
-          - SUSFS: $SUSFS_VER ($SUSFS_PIN, floating gki-android15-6.6 tip @ simonpunk/susfs4ksu)
+          - SUSFS: $SUSFS_NOTE
           - Droidspaces: $DS_STATUS
           - NoMount: $NM_STATUS
           - NTSync: $NTSYNC_STATUS
@@ -1124,6 +1216,7 @@ jobs:
           - Toolchain: Clang 23.0.1 (android build 16311247, r614150) + ThinLTO + AutoFDO
           - Build date: $BUILD_DATE
           - Inputs: release_type=$IN_REL, use_cache=$IN_CACHE, use_ds=$IN_DS, use_nomount=$IN_NM, use_ntsync=$IN_NTSYNC, use_wifi=$IN_WIFI, use_bbg=$IN_BBG
+          - SUSFS pin source: $([ "$SUSFS_FALLBACK" = "true" ] && echo "last known-good fallback" || echo "floating gki-android15-6.6 tip")
           - WiFi proof: IN_WIFI=$IN_WIFI, steps.wifi.outcome=$WIFI_OUTCOME, wifi_commit=${WIFI_PIN:-n/a}
           - kernel.string: $KSTRING
           - Image: $IMG_SIZE bytes, sha256 $IMG_SHA
@@ -1252,6 +1345,12 @@ jobs:
           [ -n "$SUSFS_PIN" ] || for i in 1 2 3 4 5; do SUSFS_PIN="$(git ls-remote https://gitlab.com/simonpunk/susfs4ksu.git refs/heads/gki-android15-6.6 | awk '{print $1; exit}' || true)"; [[ "$SUSFS_PIN" =~ ^[0-9a-f]{40}$ ]] && break || { SUSFS_PIN=""; sleep 15; }; done
           SUSFS_VER="${{ needs.build.outputs.susfs_ver }}"
           [ -n "$SUSFS_VER" ] || SUSFS_VER="unknown"
+          SUSFS_FALLBACK="${{ needs.build.outputs.susfs_fallback }}"
+          if [ "$SUSFS_FALLBACK" = "true" ]; then
+            SUSFS_NOTE="$SUSFS_VER ($SUSFS_PIN, last known-good fallback: the gki-android15-6.6 tip did not apply)"
+          else
+            SUSFS_NOTE="$SUSFS_VER ($SUSFS_PIN, floating gki-android15-6.6 tip @ simonpunk/susfs4ksu)"
+          fi
           KEXTRA="$(grep -m1 '^EXTRAVERSION' Makefile | awk '{print $3}')"
           mapfile -t TAGS < <(gh api --paginate "repos/${{ github.repository }}/tags?per_page=100" --jq '.[].name' 2>/dev/null | grep -E '^evonix-v[0-9]+$' || true)
           MAX=0
@@ -1267,7 +1366,7 @@ jobs:
           - Commit: $COMMIT
           - Kernel: 6.6.x ($KEXTRA)
           - KernelSU-Next: $KSU_PIN (latest dev-susfs @ pershoot/KernelSU-Next)
-          - SUSFS: $SUSFS_VER ($SUSFS_PIN, floating gki-android15-6.6 tip @ simonpunk/susfs4ksu)
+          - SUSFS: $SUSFS_NOTE
           - Droidspaces: $DS_STATUS
           - NoMount: $NM_STATUS
           - NTSync: $NTSYNC_STATUS

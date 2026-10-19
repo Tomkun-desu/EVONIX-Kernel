@@ -68,6 +68,7 @@ jobs:
       susfs_commit: ${{ steps.susfs.outputs.susfs_commit }}
       susfs_ver: ${{ steps.susfs.outputs.susfs_ver }}
       susfs_fallback: ${{ steps.susfs.outputs.susfs_fallback }}
+      susfs_preinit: ${{ steps.susfs.outputs.susfs_preinit }}
       ds_commit: ${{ steps.ds.outputs.ds_commit }}
       nm_commit: ${{ steps.nm.outputs.nm_commit }}
       ntsync_commit: ${{ steps.ntsync.outputs.ntsync_commit }}
@@ -292,9 +293,63 @@ jobs:
               exit 1
             fi
           fi
+          # ---- KernelSU preinit API drift guard --------------------------------
+          # The 2026-10-19 SUSFS tip is synced with the official tiann/KernelSU:
+          # its fs/exec.c block calls ksu_setup_preinit_file() and
+          # ksu_preinit_handle_post_execveat(). pershoot's KernelSU-Next does not
+          # implement that API (it hooks PID1 from kernel/hook/syscall_event_
+          # bridge.c through ksu_preinit_handle_execve(), a file KSU-Next itself
+          # drops when CONFIG_KSU_SUSFS=y), so the kernel compiled and then died
+          # at link with "ld.lld: error: undefined symbol:
+          # ksu_setup_preinit_file". fs/exec.c includes <linux/susfs_def.h>
+          # (staged by this step) before that guard, so defining KSU_NO_PREINIT
+          # there compiles the block out — SUSFS itself and the sucompat exec
+          # hooks stay enabled. Self-disabling: does nothing when the KernelSU
+          # sources do provide the tiann API, or for SUSFS tips that predate it.
+          SUSFS_PREINIT="none"
+          EXEC_C="$WORK_DIR/common/fs/exec.c"
+          SUSFS_DEF="$WORK_DIR/common/include/linux/susfs_def.h"
+          # KernelSU sources as the build sees them: resolve the tree's
+          # drivers/kernelsu symlink first, then fall back to the submodule dirs.
+          KSU_SRC="$(readlink -f "$WORK_DIR/common/drivers/kernelsu" 2>/dev/null || true)"
+          [ -n "$KSU_SRC" ] && [ -d "$KSU_SRC" ] || KSU_SRC=""
+          if [ -z "$KSU_SRC" ]; then
+            for d in "$WORK_DIR/common/KernelSU-Next/kernel" "$SRC_DIR/KernelSU-Next/kernel" "$WORK_DIR/KernelSU-Next/kernel"; do
+              if [ -d "$d" ]; then KSU_SRC="$d"; break; fi
+            done
+          fi
+          echo "KernelSU sources used for the preinit API check: ${KSU_SRC:-<not found>}"
+          if grep -q 'ksu_setup_preinit_file\|ksu_preinit_handle_post_execveat' "$EXEC_C"; then
+            if [ -n "$KSU_SRC" ] && grep -rqs 'ksu_setup_preinit_file' "$KSU_SRC"; then
+              SUSFS_PREINIT="enabled"
+              echo "SUSFS preinit hooks: KernelSU provides the tiann API, left enabled."
+            elif grep -q '^#define KSU_NO_PREINIT' "$SUSFS_DEF"; then
+              SUSFS_PREINIT="disabled"
+              echo "SUSFS preinit hooks: KSU_NO_PREINIT already present in susfs_def.h."
+            else
+              if [ -z "$KSU_SRC" ]; then
+                echo "WARNING: KernelSU sources were not found on disk, so the API check" >&2
+                echo "WARNING: could not run; assuming KernelSU-Next (no tiann preinit API)." >&2
+              fi
+              echo "WARNING: this SUSFS tip hooks the PID1 preinit through tiann/KernelSU's" >&2
+              echo "WARNING: API (ksu_setup_preinit_file/ksu_preinit_handle_post_execveat)," >&2
+              echo "WARNING: which KernelSU-Next does not implement. Defining KSU_NO_PREINIT" >&2
+              echo "WARNING: in include/linux/susfs_def.h so fs/exec.c compiles that block out." >&2
+              printf '\n/* EVONIX: KernelSU-Next exposes no tiann-style preinit API (see build-evonix.yml). */\n#define KSU_NO_PREINIT\n' >> "$SUSFS_DEF"
+              SUSFS_PREINIT="disabled"
+            fi
+            # Every use of those symbols must sit inside an #ifndef KSU_NO_PREINIT
+            # block, otherwise the define changed nothing and the link fails again.
+            awk '/#ifndef[ \t]+KSU_NO_PREINIT/ { d++ }
+                 /#endif.*KSU_NO_PREINIT/ { if (d > 0) d-- }
+                 /ksu_setup_preinit_file|ksu_preinit_handle_post_execveat/ { if (d <= 0) { printf "UNGUARDED preinit symbol at fs/exec.c:%d\n", NR; bad = 1 } }
+                 END { exit bad ? 1 : 0 }' "$EXEC_C" \
+              || { echo "ERROR: preinit symbols in fs/exec.c are not fully guarded; refusing to continue" >&2; exit 1; }
+          fi
           echo "susfs_commit=$SUSFS_PIN_USED" >> "$GITHUB_OUTPUT"
           echo "susfs_ver=$SUSFS_VER" >> "$GITHUB_OUTPUT"
           echo "susfs_fallback=$SUSFS_FALLBACK" >> "$GITHUB_OUTPUT"
+          echo "susfs_preinit=$SUSFS_PREINIT" >> "$GITHUB_OUTPUT"
           echo "SUSFS pin used: $SUSFS_PIN_USED (staged tip was $SUSFS_STAGED, fallback=$SUSFS_FALLBACK)"
           # Restore our tree's pgsize_migration rename on the two pre-existing
           # call sites only. Guarded to the exact stock context lines so a
@@ -326,6 +381,8 @@ jobs:
           ls "$WORK_DIR/common/fs/susfs.c" "$WORK_DIR/common/include/linux/susfs"*.h || true
           echo "----- susfs hook markers (fs/proc/task_mmu.c) -----"
           grep -c susfs "$WORK_DIR/common/fs/proc/task_mmu.c" || true
+          echo "----- SUSFS preinit hooks (fs/exec.c) -----"
+          echo "$SUSFS_PREINIT"
           echo "----- CONFIG_KSU_SUSFS in evonix.config -----"
           grep '^CONFIG_KSU_SUSFS' "$SUSFS_CONFIG" || true
           echo "===== END SUSFS APPLIED ====="
@@ -1205,6 +1262,7 @@ jobs:
           - Kernel: 6.6.$KVER ($KEXTRA)
           - KernelSU-Next: $KSU_PIN (dev-susfs @ pershoot/KernelSU-Next)
           - SUSFS: $SUSFS_NOTE
+          - SUSFS preinit hooks: ${{ steps.susfs.outputs.susfs_preinit }} (tiann-style preinit API vs KernelSU-Next)
           - Droidspaces: $DS_STATUS
           - NoMount: $NM_STATUS
           - NTSync: $NTSYNC_STATUS
@@ -1367,6 +1425,7 @@ jobs:
           - Kernel: 6.6.x ($KEXTRA)
           - KernelSU-Next: $KSU_PIN (latest dev-susfs @ pershoot/KernelSU-Next)
           - SUSFS: $SUSFS_NOTE
+          - SUSFS preinit hooks: ${{ needs.build.outputs.susfs_preinit }} (tiann-style preinit API vs KernelSU-Next)
           - Droidspaces: $DS_STATUS
           - NoMount: $NM_STATUS
           - NTSync: $NTSYNC_STATUS

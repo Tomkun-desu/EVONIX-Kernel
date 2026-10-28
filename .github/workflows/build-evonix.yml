@@ -387,6 +387,53 @@ jobs:
           grep '^CONFIG_KSU_SUSFS' "$SUSFS_CONFIG" || true
           echo "===== END SUSFS APPLIED ====="
 
+      - name: Route priority uid filter in KernelSU dispatcher (gated)
+        run: |
+          set -euo pipefail
+          # The floating SUSFS tip added CMD_SUSFS_SET_PRIORITY_UID_FILTER (0x60030)
+          # plus its fs/susfs.c handler, but pershoot's KernelSU-Next dispatcher does
+          # not route the command yet, so ksu_susfs answers ERR_CMD_NOT_SUPPORTED
+          # ("SUSFS operation not supported") and BRENE's "hide third party apps"
+          # toggle silently does nothing. Add the single missing case, forward-only:
+          # skipped the moment upstream ships its own routing.
+          KSU_DIR=""
+          for d in "$WORK_DIR/common/KernelSU-Next" "$SRC_DIR/KernelSU-Next"; do
+            if [ -f "$d/kernel/supercall/dispatch.c" ]; then KSU_DIR="$d"; break; fi
+          done
+          if [ -z "$KSU_DIR" ]; then
+            echo "WARNING: KernelSU-Next sources not found; priority uid filter dispatch NOT patched" >&2
+            exit 0
+          fi
+          DISPATCH="$KSU_DIR/kernel/supercall/dispatch.c"
+          if grep -q CMD_SUSFS_SET_PRIORITY_UID_FILTER "$DISPATCH"; then
+            echo "===== PRIORITY UID FILTER: upstream dispatcher already routes 0x60030 ====="
+            exit 0
+          fi
+          SUSFS_INC="$WORK_DIR/common/include/linux"
+          if ! grep -q CMD_SUSFS_SET_PRIORITY_UID_FILTER "$SUSFS_INC/susfs_def.h" 2>/dev/null ||
+             ! grep -q "void susfs_set_priority_uid_filter" "$SUSFS_INC/susfs.h" 2>/dev/null; then
+            echo "WARNING: staged SUSFS headers carry no priority uid filter ABI; dispatch NOT patched" >&2
+            exit 0
+          fi
+          rc=0
+          python3 - "$DISPATCH" <<'PY' || rc=$?
+          import sys
+          path = sys.argv[1]
+          src = open(path).read()
+          anchor = "        case CMD_SUSFS_SHOW_ENABLED_FEATURES:"
+          add = ("        case CMD_SUSFS_SET_PRIORITY_UID_FILTER:\n"
+                 "            susfs_set_priority_uid_filter(arg);\n"
+                 "            return 0;\n")
+          if src.count(anchor) != 1:
+              sys.exit("anchor not found exactly once")
+          open(path, "w").write(src.replace(anchor, add + anchor, 1))
+          PY
+          if [ "$rc" -ne 0 ]; then
+            echo "WARNING: dispatch patch skipped (KernelSU-Next drifted, rc=$rc); SUSFS uid filter stays unsupported" >&2
+            exit 0
+          fi
+          grep -n "CMD_SUSFS_SET_PRIORITY_UID_FILTER" "$DISPATCH"
+          echo "===== PRIORITY UID FILTER DISPATCH PATCHED ====="
       - name: Apply Droidspaces-OSS (optional, dispatch only)
         id: ds
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.use_ds }}

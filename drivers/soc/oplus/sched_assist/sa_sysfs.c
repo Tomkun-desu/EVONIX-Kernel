@@ -48,11 +48,11 @@ int global_sched_assist_enabled;
 EXPORT_SYMBOL(global_sched_assist_enabled);
 int global_sched_assist_scene;
 EXPORT_SYMBOL(global_sched_assist_scene);
-int global_silver_perf_core;
+int global_silver_perf_core = 1;
 EXPORT_SYMBOL(global_silver_perf_core);
 int global_lowend_plat_opt;
 EXPORT_SYMBOL(global_lowend_plat_opt);
-int global_sched_group_enabled = 0;
+int global_sched_group_enabled = 1;
 EXPORT_SYMBOL(global_sched_group_enabled);
 
 pid_t global_ux_task_pid = -1;
@@ -65,7 +65,7 @@ unsigned int top_app_type;
 struct proc_dir_entry *d_oplus_scheduler;
 struct proc_dir_entry *d_sched_assist;
 
-static int disable_setting = 1;
+static int disable_setting = 0;
 
 #ifdef CONFIG_OPLUS_FEATURE_TICK_GRAN
 static u64 last_total_instr;
@@ -752,14 +752,15 @@ static ssize_t proc_im_flag_read(struct file *file, char __user *buf,
 	size_t len = 0;
 	struct task_struct *task = NULL;
 
-	task = find_task_by_vpid(global_im_flag_pid);
+	task = find_get_task_by_vpid(READ_ONCE(global_im_flag_pid));
 	if (task) {
-		get_task_struct(task);
 		len = snprintf(buffer, sizeof(buffer), "comm=%s pid=%d tgid=%d im_flag=0x%08lx\n",
 			task->comm, task->pid, task->tgid, oplus_get_im_flag(task));
-		put_task_struct(task);
 	} else
 		len = snprintf(buffer, sizeof(buffer), "Can not find task\n");
+
+	if (task)
+		put_task_struct(task);
 
 	return simple_read_from_buffer(buf, count, ppos, buffer, len);
 }
@@ -860,14 +861,15 @@ static ssize_t proc_im_flag_app_read(struct file *file, char __user *buf,
 	size_t len = 0;
 	struct task_struct *task = NULL;
 
-	task = find_task_by_vpid(global_im_flag_pid);
+	task = find_get_task_by_vpid(READ_ONCE(global_im_flag_pid));
 	if (task && can_access_im_flag_app(task)) {
-		get_task_struct(task);
 		len = snprintf(buffer, sizeof(buffer), "comm=%s pid=%d tgid=%d im_flag=0x%08lx\n",
 			task->comm, task->pid, task->tgid, oplus_get_im_flag(task));
-		put_task_struct(task);
 	} else
 		len = snprintf(buffer, sizeof(buffer), "Can not find task\n");
+
+	if (task)
+		put_task_struct(task);
 
 	return simple_read_from_buffer(buf, count, ppos, buffer, len);
 }
@@ -1186,6 +1188,45 @@ static const struct proc_ops proc_lowend_plat_opt_fops = {
 	.proc_lseek		= default_llseek,
 };
 
+static char sa_sched_prop_buf[128] = "0\n";
+static DEFINE_MUTEX(sa_sched_prop_lock);
+
+static ssize_t proc_sched_prop_write(struct file *file, const char __user *buf,
+		size_t count, loff_t *ppos)
+{
+	size_t len = min(count, sizeof(sa_sched_prop_buf) - 1);
+
+	mutex_lock(&sa_sched_prop_lock);
+	if (copy_from_user(sa_sched_prop_buf, buf, len)) {
+		mutex_unlock(&sa_sched_prop_lock);
+		return -EFAULT;
+	}
+	sa_sched_prop_buf[len] = '\0';
+	mutex_unlock(&sa_sched_prop_lock);
+
+	return count;
+}
+
+static ssize_t proc_sched_prop_read(struct file *file, char __user *buf,
+		size_t count, loff_t *ppos)
+{
+	char kbuf[128];
+	size_t len;
+
+	mutex_lock(&sa_sched_prop_lock);
+	strscpy(kbuf, sa_sched_prop_buf, sizeof(kbuf));
+	mutex_unlock(&sa_sched_prop_lock);
+
+	len = strlen(kbuf);
+	return simple_read_from_buffer(buf, count, ppos, kbuf, len);
+}
+
+static const struct proc_ops proc_sched_prop_fops = {
+	.proc_write		= proc_sched_prop_write,
+	.proc_read		= proc_sched_prop_read,
+	.proc_lseek		= default_llseek,
+};
+
 #if IS_ENABLED(CONFIG_OPLUS_FEATURE_LOADBALANCE)
 extern void oplus_lb_proc_init(struct proc_dir_entry *pde);
 extern void oplus_lb_proc_deinit(struct proc_dir_entry *pde);
@@ -1294,9 +1335,17 @@ int oplus_sched_assist_proc_init(void)
 		remove_proc_entry("lowend_plat_opt", d_sched_assist);
 	}
 
+	proc_node = proc_create("sched_prop", 0666, d_sched_assist, &proc_sched_prop_fops);
+	if (!proc_node) {
+		ux_err("failed to create proc node sched_prop\n");
+		remove_proc_entry("sched_prop", d_sched_assist);
+	}
+
 	device_node = of_find_compatible_node(NULL, NULL, "oplus,sched_assit");
 	if (device_node)
 		disable_setting = 0;
+	else
+		disable_setting = 0; /* Rodin Dimensity 8400 fallback */
 
 #ifdef CONFIG_OPLUS_SCHED_GROUP_OPT
 	oplus_sched_group_init(d_sched_assist);
@@ -1344,6 +1393,7 @@ void oplus_sched_assist_proc_deinit(void)
 	remove_proc_entry("ux_task", d_sched_assist);
 	remove_proc_entry("sched_assist_scene", d_sched_assist);
 	remove_proc_entry("sched_assist_enabled", d_sched_assist);
+	remove_proc_entry("sched_prop", d_sched_assist);
 	remove_proc_entry("lowend_plat_opt", d_sched_assist);
 	remove_proc_entry(OPLUS_SCHEDASSIST_PROC_DIR, d_oplus_scheduler);
 	remove_proc_entry(OPLUS_SCHEDULER_PROC_DIR, NULL);

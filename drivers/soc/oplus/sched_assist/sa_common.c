@@ -195,6 +195,12 @@ struct ux_sched_cputopo ux_sched_cputopo;
  * Do not share rq->android_oem_data1 with Xiaomi/MTK scheduler modules.
  */
 static struct oplus_rq evonix_oplus_rq_data[NR_CPUS];
+static DEFINE_PER_CPU(spinlock_t, evonix_ux_list_locks);
+#if defined(CONFIG_LOCKING_PROTECT) && !defined(CONFIG_LOCKING_LAST_ENTITY)
+static DEFINE_PER_CPU(spinlock_t, evonix_locking_list_locks);
+#endif
+bool evonix_sa_initialized;
+
 
 struct oplus_rq *evonix_get_oplus_rq(struct rq *rq)
 {
@@ -868,7 +874,7 @@ void sched_assist_init_oplus_rq(void)
 		orq = evonix_get_oplus_rq(rq);
 		orq->ux_list = RB_ROOT_CACHED;
 		orq->exec_timeline = RB_ROOT_CACHED;
-		orq->ux_list_lock = kmalloc(sizeof(spinlock_t), GFP_KERNEL);
+		orq->ux_list_lock = &per_cpu(evonix_ux_list_locks, cpu);
 		spin_lock_init(orq->ux_list_lock);
 		orq->nr_running = 0;
 		orq->min_vruntime = 0;
@@ -876,7 +882,7 @@ void sched_assist_init_oplus_rq(void)
 #ifdef CONFIG_LOCKING_PROTECT
 #ifndef CONFIG_LOCKING_LAST_ENTITY
 		INIT_LIST_HEAD(&orq->locking_thread_list);
-		orq->locking_list_lock = kmalloc(sizeof(spinlock_t), GFP_KERNEL);
+		orq->locking_list_lock = &per_cpu(evonix_locking_list_locks, cpu);
 		spin_lock_init(orq->locking_list_lock);
 		orq->rq_locking_task = 0;
 #endif
@@ -1233,6 +1239,10 @@ static void dequeue_ux_thread(struct rq *rq, struct task_struct *p)
 
 void queue_ux_thread(struct rq *rq, struct task_struct *p, int enqueue)
 {
+	/* Direct scheduler calls can precede this driver's initcall. */
+	if (unlikely(!smp_load_acquire(&evonix_sa_initialized)))
+		return;
+
 	if (enqueue)
 		enqueue_ux_thread(rq, p);
 	else
@@ -2004,34 +2014,6 @@ void android_vh_sched_setaffinity_early_handler(void *unused, struct task_struct
 #endif
 
 #ifdef CONFIG_OPLUS_SCHED_GROUP_OPT
-
-static inline s64 entity_key(struct cfs_rq *cfs_rq, struct sched_entity *se)
-{
-	return (s64)(se->vruntime - cfs_rq->min_vruntime);
-}
-
-u64 avg_vruntime(struct cfs_rq *cfs_rq)
-{
-	struct sched_entity *curr = cfs_rq->curr;
-	s64 avg = cfs_rq->avg_vruntime;
-	long load = cfs_rq->avg_load;
-
-	if (curr && curr->on_rq) {
-		unsigned long weight = scale_load_down(curr->load.weight);
-
-		avg += entity_key(cfs_rq, curr) * weight;
-		load += weight;
-	}
-
-	if (load) {
-		/* sign flips effective floor / ceil */
-		if (avg < 0)
-			avg -= (load - 1);
-		avg = div_s64(avg, load);
-	}
-
-	return cfs_rq->min_vruntime + avg;
-}
 
 static inline void update_load_set(struct load_weight *lw, unsigned long w)
 {

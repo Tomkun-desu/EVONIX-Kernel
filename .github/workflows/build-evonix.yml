@@ -387,6 +387,68 @@ jobs:
           grep '^CONFIG_KSU_SUSFS' "$SUSFS_CONFIG" || true
           echo "===== END SUSFS APPLIED ====="
 
+      - name: Gate SUSFS supercalls missing from the 6.6 SUSFS branch
+        run: |
+          set -euo pipefail
+          # The floating KernelSU-Next fork tracks susfs4ksu's
+          # gki-android14-6.1 branch, which gained the sus_path_uid_filter
+          # feature (0x55554) before gki-android15-6.6 did. Its dispatch.c and
+          # pkg_observer.c call CMD_SUSFS_SET_SUS_PATH_UID_FILTER /
+          # susfs_set_sus_path_uid_filter() / susfs_parse_sus_path_app_strings()
+          # unconditionally, so the build breaks until this branch's SUSFS
+          # headers carry that ABI. Gate the call sites on the ABI macro: the
+          # build stays green now, and the feature switches itself back on as
+          # soon as the 6.6 branch catches up. The ksu_susfs userspace tool
+          # from that same pin cannot issue the call either, so nothing is
+          # lost on device.
+          SUSFS_DEF="$WORK_DIR/common/include/linux/susfs_def.h"
+          SUSFS_H="$WORK_DIR/common/include/linux/susfs.h"
+          KSU_DIR="$WORK_DIR/common/drivers/kernelsu"
+          if grep -qs 'define CMD_SUSFS_SET_SUS_PATH_UID_FILTER' "$SUSFS_DEF" "$SUSFS_H"; then
+            echo "SUSFS provides sus_path_uid_filter: KernelSU call sites left enabled."
+            exit 0
+          fi
+          echo "SUSFS lacks sus_path_uid_filter: gating KernelSU call sites."
+          python3 - "$KSU_DIR" <<'PY'
+          import sys
+          from pathlib import Path
+
+          root = Path(sys.argv[1])
+
+          def gate(rel, old, new, count):
+              p = root / rel
+              s = p.read_text()
+              if new in s:
+                  print("already gated: " + rel)
+                  return
+              n = s.count(old)
+              if n != count:
+                  sys.exit("ERROR: " + rel + ": expected " + str(count) + " match(es), found " + str(n))
+              p.write_text(s.replace(old, new))
+              print("gated " + str(n) + " call site(s) in " + rel)
+
+          gate("supercall/dispatch.c",
+               "        case CMD_SUSFS_SET_SUS_PATH_UID_FILTER:\n"
+               "            susfs_set_sus_path_uid_filter(arg);\n"
+               "            return 0;\n",
+               "#ifdef CMD_SUSFS_SET_SUS_PATH_UID_FILTER\n"
+               "        case CMD_SUSFS_SET_SUS_PATH_UID_FILTER:\n"
+               "            susfs_set_sus_path_uid_filter(arg);\n"
+               "            return 0;\n"
+               "#endif\n",
+               1)
+          gate("manager/pkg_observer.c",
+               "    // Renew the sus path uid bitmap filter\n"
+               "    susfs_parse_sus_path_app_strings();\n",
+               "#ifdef CMD_SUSFS_SET_SUS_PATH_UID_FILTER\n"
+               "    // Renew the sus path uid bitmap filter\n"
+               "    susfs_parse_sus_path_app_strings();\n"
+               "#endif\n",
+               2)
+          PY
+          grep -n 'CMD_SUSFS_SET_SUS_PATH_UID_FILTER\|susfs_parse_sus_path_app_strings' \
+            "$KSU_DIR/supercall/dispatch.c" "$KSU_DIR/manager/pkg_observer.c"
+
       - name: Apply Droidspaces-OSS (optional, dispatch only)
         id: ds
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.use_ds }}

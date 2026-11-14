@@ -76,12 +76,15 @@ jobs:
       bbg_commit: ${{ steps.bbg.outputs.bbg_commit }}
       bbg_allowlist: ${{ steps.bbg.outputs.bbg_allowlist }}
     steps:
-      - name: Checkout current branch (+ submodules)
+      - name: Checkout current branch
         uses: actions/checkout@v4
         with:
           ref: ${{ github.ref }}
           fetch-depth: 1
-          submodules: recursive
+          # KernelSU-Next is cloned at its floating tip further down: the
+          # recorded gitlink dies whenever the fork force-pushes, and
+          # `submodules: recursive` then fails the run before anything builds.
+          submodules: false
           path: src
 
       - name: Free disk space
@@ -131,8 +134,6 @@ jobs:
         run: |
           set -euo pipefail
           cd "$WORK_DIR/common"
-          git submodule update --init --recursive
-          git ls-tree HEAD KernelSU-Next
           # Unpinned: resolve the tip of pershoot/dev-susfs (same source the
           # GKI reference uses when SUSFS is on) and check it out, so every
           # build uses the latest KernelSU-Next.
@@ -142,16 +143,23 @@ jobs:
           [[ "$KSU_TIP" =~ ^[0-9a-f]{40}$ ]] || { echo "ERROR: could not resolve KernelSU-Next tip" >&2; exit 1; }
           echo "KernelSU-Next tip: $KSU_TIP"
           echo "ksu_sha=$KSU_TIP" >> "$GITHUB_OUTPUT"
+          # Never trust the recorded gitlink: the fork rebases, so its commit
+          # can disappear from upstream and `submodule update` fails the whole
+          # run (seen on coloros/ksu-susfs: gitlink 8ecdbd0 no longer exists).
+          # checkout runs with submodules off, so clone the tree here instead.
+          if [ ! -d KernelSU-Next/.git ]; then
+            rm -rf KernelSU-Next
+            for i in 1 2 3; do
+              git clone "$KSU_URL" KernelSU-Next && break || { rm -rf KernelSU-Next; [ "$i" -eq 3 ] && exit 1; sleep 10; }
+            done
+          fi
+          git ls-tree HEAD KernelSU-Next
           for i in 1 2 3; do
             # Kbuild (kernel/Kbuild) derives version as 30000 + rev-list --count
-            # of merge-base(HEAD, origin/dev) and tag via describe --tags: a
-            # depth-1 detached SHA has count=1 (=> 30001) and no tags (=> empty
-            # tag). Fetch branch refs + tags with full history and check out
-            # the branch so abbrev-ref/merge-base/describe resolve correctly.
-            git -C KernelSU-Next fetch --unshallow --tags "$KSU_URL" \
-              "+refs/heads/dev-susfs:refs/remotes/origin/dev-susfs" \
-              "+refs/heads/dev:refs/remotes/origin/dev" \
-            || git -C KernelSU-Next fetch --tags "$KSU_URL" \
+            # of merge-base(HEAD, origin/dev) and tag via describe --tags, so
+            # the clone above stays full and the branch refs + tags must be
+            # fetched before the checkout for abbrev-ref/describe to resolve.
+            git -C KernelSU-Next fetch --tags "$KSU_URL" \
               "+refs/heads/dev-susfs:refs/remotes/origin/dev-susfs" \
               "+refs/heads/dev:refs/remotes/origin/dev" \
             && break || { [ "$i" -eq 3 ] && exit 1; sleep 10; }

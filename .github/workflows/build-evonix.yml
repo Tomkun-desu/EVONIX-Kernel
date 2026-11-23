@@ -477,9 +477,16 @@ jobs:
           git -C "$RUNNER_TEMP/Droidspaces-OSS" fetch --depth=1 origin "$DS_COMMIT"
           git -C "$RUNNER_TEMP/Droidspaces-OSS" checkout "$DS_COMMIT"
           [ "$(git -C "$RUNNER_TEMP/Droidspaces-OSS" rev-parse HEAD)" = "$DS_COMMIT" ] || { echo "Droidspaces pin mismatch" >&2; exit 1; }
-          # SYSVIPC kABI fix for android15-6.6 (same patch file the GKI
-          # reference applies for this version; dry-run verified on our tree).
-          patch -p1 -d "$WORK_DIR/common" < "$RUNNER_TEMP/Droidspaces-OSS/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch"
+          # SYSVIPC kABI fix for android15-6.6. V4.6 already wires sysv_sem /
+          # sysv_shm into the task_struct kABI slots, so the patch is only for
+          # older trees — skip it when the wiring is present.
+          DS_SCHED="$WORK_DIR/common/include/linux/sched.h"
+          if grep -q 'struct sysv_sem sysvsem' "$DS_SCHED"; then
+            echo "SYSVIPC kABI fix already in sched.h, Droidspaces patch skipped"
+          else
+            patch -p1 -d "$WORK_DIR/common" < "$RUNNER_TEMP/Droidspaces-OSS/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch"
+          fi
+          grep -q 'struct sysv_sem sysvsem' "$DS_SCHED" || { echo "ERROR: SYSVIPC kABI wiring missing from sched.h" >&2; exit 1; }
           # Droidspaces kernel configs from the committed fragment
           # arch/arm64/configs/evonix-ds.config (visible/auditable; same 9
           # symbols as the reference Enable Kernel Configs step, USER_NS off).

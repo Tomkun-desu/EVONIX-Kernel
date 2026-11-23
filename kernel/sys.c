@@ -217,6 +217,7 @@ out:
 	return error;
 }
 
+
 SYSCALL_DEFINE3(setpriority, int, which, int, who, int, niceval)
 {
 	struct task_struct *g, *p;

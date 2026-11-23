@@ -70,6 +70,7 @@
 
 #include <trace/hooks/selinux.h>
 
+
 struct selinux_policy_convert_data {
 	struct convert_context_args args;
 	struct sidtab_convert_params sidtab_params;
@@ -2197,6 +2198,7 @@ void selinux_policy_commit(struct selinux_load_state *load_state)
 			pr_info("SELinux: Enabling MLS support...\n");
 	}
 
+
 	/* Set latest granting seqno for new policy. */
 	if (oldpolicy)
 		newpolicy->latest_granting = oldpolicy->latest_granting + 1;
@@ -3075,6 +3077,7 @@ int security_set_bools(u32 len, int *values)
 	/* Re-evaluate the conditional rules in the copy */
 	evaluate_cond_nodes(&newpolicy->policydb);
 
+
 	/* Set latest granting seqno for new policy */
 	newpolicy->latest_granting = oldpolicy->latest_granting + 1;
 	seqno = newpolicy->latest_granting;
@@ -3354,6 +3357,7 @@ int security_get_classes(struct selinux_policy *policy,
 			 char ***classes, u32 *nclasses)
 {
 	struct policydb *policydb;
+	u32 i;
 	int rc;
 
 	policydb = &policy->policydb;
@@ -3366,15 +3370,22 @@ int security_get_classes(struct selinux_policy *policy,
 
 	rc = hashtab_map(&policydb->p_classes.table, get_classes_callback,
 			 *classes);
-	if (rc) {
-		u32 i;
+	if (rc)
+		goto err;
 
-		for (i = 0; i < *nclasses; i++)
-			kfree((*classes)[i]);
-		kfree(*classes);
+	for (i = 0; i < *nclasses; i++) {
+		if (!(*classes)[i]) {
+			rc = -EINVAL;
+			goto err;
+		}
 	}
 
 out:
+	return rc;
+err:
+	for (i = 0; i < *nclasses; i++)
+		kfree((*classes)[i]);
+	kfree(*classes);
 	return rc;
 }
 
@@ -4008,3 +4019,4 @@ int security_read_state_kernel(void **data, size_t *len)
 	}
 	return err;
 }
+

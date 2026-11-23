@@ -27,9 +27,8 @@ for f in $(git diff --name-only --diff-filter=U); do
 done
 
 # 1. Floated sources. The modify/delete conflicts leave the parent's copy behind.
-git rm -q -f --ignore-unmatch fs/susfs.c include/linux/susfs.h include/linux/susfs_def.h
-rm -rf fs/nomount security/baseband-guard
-rm -f drivers/misc/ntsync.c include/uapi/linux/ntsync.h
+git rm -r -q -f --ignore-unmatch fs/susfs.c include/linux/susfs.h include/linux/susfs_def.h \
+	fs/nomount security/baseband-guard drivers/misc/ntsync.c include/uapi/linux/ntsync.h
 
 # 2. Floated Kconfig/Makefile wiring (the build-time patches add it back).
 sed -i -E \
@@ -57,6 +56,7 @@ PY
 git diff --cached --name-only --diff-filter=ACMR |
 	grep -E '(\.(c|h|S|cc)$|/Makefile$|Kconfig$)' |
 	while read -r f; do
+		test -f "$f" || continue
 		awk -f "$here/strip-hooks.awk" "$f" >"$f.tmp"
 		if cmp -s "$f" "$f.tmp"; then rm -f "$f.tmp"; else mv "$f.tmp" "$f"; fi
 	done

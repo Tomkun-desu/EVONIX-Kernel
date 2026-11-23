@@ -10,6 +10,7 @@
 #
 # usage: sync/resolve.sh <hyperos|coloros>
 set -euo pipefail
+here="$(cd "$(dirname "$0")" && pwd)"
 cd "$(git rev-parse --show-toplevel)"
 flavor="${1:?usage: sync/resolve.sh <hyperos|coloros>}"
 
@@ -56,13 +57,13 @@ PY
 git diff --cached --name-only --diff-filter=ACMR |
 	grep -E '(\.(c|h|S|cc)$|/Makefile$|Kconfig$)' |
 	while read -r f; do
-		awk -f sync/strip-hooks.awk "$f" >"$f.tmp"
+		awk -f "$here/strip-hooks.awk" "$f" >"$f.tmp"
 		if cmp -s "$f" "$f.tmp"; then rm -f "$f.tmp"; else mv "$f.tmp" "$f"; fi
 	done
 
 # 4. Our config fragment: upstream V4.6 symbols, floated subsystems off,
 #    Wild-port extras kept.
-cp "sync/conf/evonix.$flavor.config" arch/arm64/configs/evonix.config
+cp "$here/conf/evonix.$flavor.config" arch/arm64/configs/evonix.config
 git add -A
 
 # 5. Everything that must be gone really is gone.

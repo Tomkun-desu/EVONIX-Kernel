@@ -79,14 +79,16 @@ jobs:
         if: inputs.apply
         env:
           BRANCH: ${{ inputs.branch }}
-          SRC_REF: ${{ github.ref_name }}
         run: |
           set -o pipefail
-          # The resolvers live on the dispatch branch, the merge happens on BRANCH.
-          git fetch --no-tags --depth=1 origin "+refs/heads/${SRC_REF}:refs/remotes/sync-src"
-          mkdir -p "$RUNNER_TEMP/sync"
-          git archive refs/remotes/sync-src sync | tar -x -C "$RUNNER_TEMP"
-          echo "resolvers from $(git rev-parse refs/remotes/sync-src)"
+          # The resolvers live on the dispatched commit, the merge happens on BRANCH.
+          mkdir -p "$RUNNER_TEMP/sync/conf"
+          base="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/sync"
+          for f in resolve.sh strip-hooks.awk conf/evonix.hyperos.config conf/evonix.coloros.config; do
+            curl -fsSL --retry 3 --retry-all-errors "$base/$f" -o "$RUNNER_TEMP/sync/$f"
+          done
+          chmod +x "$RUNNER_TEMP/sync/resolve.sh"
+          echo "resolvers from ${GITHUB_SHA}"
           test -x "$RUNNER_TEMP/sync/resolve.sh" || { echo "::error::sync/resolve.sh missing on $SRC_REF"; exit 1; }
           bash "$RUNNER_TEMP/sync/resolve.sh" "${BRANCH%%/*}"
           test -z "$(git diff --name-only --diff-filter=U)" || { echo "::error::merge still unmerged"; exit 1; }

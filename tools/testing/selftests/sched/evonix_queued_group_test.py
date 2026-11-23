@@ -6,15 +6,17 @@ from pathlib import Path
 import random
 import re
 import subprocess
+import sys
 import tempfile
 import unittest
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from evonix_policy_test import function
 
 ROOT = Path(__file__).resolve().parents[4]
 FAIR = (ROOT / "kernel/sched/fair.c").read_text()
 BASE = subprocess.check_output(
-    ["git", "show", "df029710f:kernel/sched/fair.c"], cwd=ROOT, text=True)
+    ["git", "show", "f002a55c7f0a8:kernel/sched/fair.c"], cwd=ROOT, text=True)
 
 
 def guard(source):

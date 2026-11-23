@@ -95,18 +95,10 @@ jobs:
           grep -q '^EXTRAVERSION' Makefile
           echo "=== merge stat ==="
           git diff --cached --stat | tail -n 25
-          git commit -q -F - <<'MSG'
-Merge parent fork (V4.6) with the floating-subsystem carve-outs
-
-In-tree SUSFS, NoMount and Baseband-Guard from the parent are dropped: this
-fork floats all three at build time (workflow steps + fragments), so their
-sources and hooks must not sit in the tree. Their hook files stay as ours,
-which keeps the tree hook-free but forgoes the parent's stable fixes inside
-those specific files.
-
-Curated on top of upstream: Makefile branding, our evonix.config fragment
-plus the new V4.6 feature symbols, our build-evonix.sh guards.
-MSG
+          git commit -q \
+            -m "Merge parent fork (V4.6) with the floating-subsystem carve-outs" \
+            -m "In-tree SUSFS, NoMount and Baseband-Guard from the parent are dropped: this fork floats all three at build time (workflow steps + fragments), so their sources and hooks must not sit in the tree. Their hook files stay as ours, which keeps the tree hook-free but forgoes the parent's stable fixes inside those specific files." \
+            -m "Curated on top of upstream: Makefile branding, our evonix.config fragment plus the new V4.6 feature symbols, our build-evonix.sh guards."
           git log --oneline -1
           git push origin "HEAD:${{ inputs.branch }}"
           echo "pushed $(git rev-parse HEAD) to ${{ inputs.branch }}"

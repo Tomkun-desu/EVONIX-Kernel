@@ -83,8 +83,10 @@ jobs:
         run: |
           set -o pipefail
           # The resolvers live on the dispatch branch, the merge happens on BRANCH.
+          git fetch --no-tags --depth=1 origin "+refs/heads/${SRC_REF}:refs/remotes/sync-src"
           mkdir -p "$RUNNER_TEMP/sync"
-          git archive "refs/remotes/origin/$SRC_REF" sync | tar -x -C "$RUNNER_TEMP"
+          git archive refs/remotes/sync-src sync | tar -x -C "$RUNNER_TEMP"
+          echo "resolvers from $(git rev-parse refs/remotes/sync-src)"
           test -x "$RUNNER_TEMP/sync/resolve.sh" || { echo "::error::sync/resolve.sh missing on $SRC_REF"; exit 1; }
           bash "$RUNNER_TEMP/sync/resolve.sh" "${BRANCH%%/*}"
           test -z "$(git diff --name-only --diff-filter=U)" || { echo "::error::merge still unmerged"; exit 1; }

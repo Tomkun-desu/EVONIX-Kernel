@@ -66,7 +66,6 @@ int ioprio_check_cap(int ioprio)
 	return 0;
 }
 
-
 SYSCALL_DEFINE3(ioprio_set, int, which, int, who, int, ioprio)
 {
 	struct task_struct *p, *g;
@@ -115,6 +114,7 @@ SYSCALL_DEFINE3(ioprio_set, int, which, int, who, int, ioprio)
 				user = current_user();
 			else
 				user = find_user(uid);
+
 			if (!user)
 				break;
 
@@ -250,6 +250,7 @@ SYSCALL_DEFINE2(ioprio_get, int, which, int, who)
 				user = current_user();
 			else
 				user = find_user(uid);
+
 			if (!user)
 				break;
 

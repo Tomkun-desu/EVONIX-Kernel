@@ -30,6 +30,16 @@ done
 git rm -r -q -f --ignore-unmatch fs/susfs.c include/linux/susfs.h include/linux/susfs_def.h \
 	fs/nomount security/baseband-guard drivers/misc/ntsync.c include/uapi/linux/ntsync.h
 
+# 1b. Files where upstream's whole change is hook code: our pre-merge file is
+#     the pristine context the floating patch applies to, so keep ours instead
+#     of leaving a stripped approximation.
+base="$(git merge-base HEAD MERGE_HEAD)"
+up="$(git rev-parse MERGE_HEAD)"
+python3 "$here/hookonly.py" "$base" "$up" | while read -r f; do
+	git checkout HEAD -- "$f"
+	echo "hook-only, kept ours: $f"
+done
+
 # 2. Floated Kconfig/Makefile wiring (the build-time patches add it back).
 sed -i -E \
 	-e '\#^obj-\$\(CONFIG_(KSU_SUSFS|NOMOUNT|BBG|NTSYNC)\)#d' \
@@ -58,6 +68,7 @@ git diff --cached --name-only --diff-filter=ACMR |
 	while read -r f; do
 		test -f "$f" || continue
 		awk -f "$here/strip-hooks.awk" "$f" >"$f.tmp"
+		perl -0pi -e 's/\n+\z/\n/' "$f.tmp"
 		if cmp -s "$f" "$f.tmp"; then rm -f "$f.tmp"; else mv "$f.tmp" "$f"; fi
 	done
 

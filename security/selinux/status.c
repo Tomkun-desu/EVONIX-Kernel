@@ -13,7 +13,6 @@
 #include "avc.h"
 #include "security.h"
 
-
 /*
  * The selinux_status_page shall be exposed to userspace applications
  * using mmap interface on /selinux/status.
@@ -85,7 +84,6 @@ void selinux_status_update_setenforce(bool enforcing)
 	if (selinux_state.status_page) {
 		status = page_address(selinux_state.status_page);
 
-
 		status->sequence++;
 		smp_wmb();
 
@@ -110,7 +108,6 @@ void selinux_status_update_policyload(u32 seqno)
 	mutex_lock(&selinux_state.status_lock);
 	if (selinux_state.status_page) {
 		status = page_address(selinux_state.status_page);
-
 
 		status->sequence++;
 		smp_wmb();

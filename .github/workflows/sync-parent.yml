@@ -1,0 +1,112 @@
+name: Sync parent fork
+
+# Merges NEESCHAL-3/EVONIX-Kernel into one of our branches on a runner
+# (the phone cannot clone this tree). Report mode is read-only: it merges
+# without committing, prints every unmerged path and exits. Apply mode runs
+# sync/resolve.sh, verifies the result, commits and pushes the merge.
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch to sync"
+        type: choice
+        required: true
+        options:
+          - hyperos/ksu-susfs
+          - coloros/ksu-susfs
+      apply:
+        description: "Commit and push the resolved merge (otherwise report only)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-parent-${{ inputs.branch }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+          fetch-depth: 0
+          submodules: false
+
+      - name: Merge parent (no commit)
+        run: |
+          set -o pipefail
+          git config user.name "evonix-sync"
+          git config user.email "evonix-sync@users.noreply.github.com"
+          git remote add upstream https://github.com/NEESCHAL-3/EVONIX-Kernel.git
+          git fetch --no-tags upstream "refs/heads/${{ inputs.branch }}"
+          UP="$(git rev-parse FETCH_HEAD)"
+          BASE="$(git merge-base HEAD "$UP")"
+          echo "ours:        $(git rev-parse HEAD)"
+          echo "upstream:    $UP"
+          echo "merge-base:  $BASE"
+          echo "payload commits: $(git rev-list --count "$BASE..$UP")"
+          echo "payload files:   $(git diff --name-only "$BASE" "$UP" | wc -l)"
+          echo "ours-only files: $(git diff --name-only "$BASE" HEAD | wc -l)"
+          git merge --no-commit --no-ff "$UP" > /tmp/merge.log 2>&1 || true
+          echo "=== merge output (tail) ==="
+          tail -n 40 /tmp/merge.log
+          git diff --name-only --diff-filter=U | sort > /tmp/unmerged.txt || true
+          echo "=== unmerged paths: $(wc -l < /tmp/unmerged.txt) ==="
+          cat /tmp/unmerged.txt
+          echo "=== touched by upstream, also ours (overlap) ==="
+          git diff --name-only "$BASE" "$UP" | sort > /tmp/up.txt
+          git diff --name-only "$BASE" HEAD | sort > /tmp/ours.txt
+          comm -12 /tmp/up.txt /tmp/ours.txt | tee /tmp/overlap.txt | wc -l
+          comm -12 /tmp/up.txt /tmp/ours.txt | head -n 200
+
+      - name: Upload merge report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: merge-report
+          path: |
+            /tmp/merge.log
+            /tmp/unmerged.txt
+            /tmp/overlap.txt
+          if-no-files-found: ignore
+
+      - name: Resolve and verify
+        if: inputs.apply
+        run: |
+          set -o pipefail
+          test -x sync/resolve.sh || { echo "::error::sync/resolve.sh missing"; exit 1; }
+          sync/resolve.sh
+          echo "=== unmerged after resolve: $(git diff --name-only --diff-filter=U | wc -l) ==="
+          git diff --name-only --diff-filter=U
+          test -z "$(git diff --name-only --diff-filter=U)" || { echo "::error::merge still unmerged"; exit 1; }
+          git add -A
+          git diff --cached --check
+          bash -n build-evonix.sh
+          ! test -e fs/susfs.c || { echo "::error::in-tree fs/susfs.c came back"; exit 1; }
+          ! test -d security/baseband-guard || { echo "::error::in-tree baseband-guard came back"; exit 1; }
+          ! grep -q 'CONFIG_KSU_SUSFS' arch/arm64/configs/evonix.config || { echo "::error::in-tree SUSFS config came back"; exit 1; }
+          ! grep -q 'CONFIG_BBG' arch/arm64/configs/evonix.config || { echo "::error::BBG config came back"; exit 1; }
+          ! grep -q 'CONFIG_NOMOUNT' arch/arm64/configs/evonix.config || { echo "::error::in-tree NoMount config came back"; exit 1; }
+          grep -q '^EXTRAVERSION' Makefile
+          echo "=== merge stat ==="
+          git diff --cached --stat | tail -n 25
+          git commit -q -F - <<'MSG'
+Merge parent fork (V4.6) with the floating-subsystem carve-outs
+
+In-tree SUSFS, NoMount and Baseband-Guard from the parent are dropped: this
+fork floats all three at build time (workflow steps + fragments), so their
+sources and hooks must not sit in the tree. Their hook files stay as ours,
+which keeps the tree hook-free but forgoes the parent's stable fixes inside
+those specific files.
+
+Curated on top of upstream: Makefile branding, our evonix.config fragment
+plus the new V4.6 feature symbols, our build-evonix.sh guards.
+MSG
+          git log --oneline -1
+          git push origin "HEAD:${{ inputs.branch }}"
+          echo "pushed $(git rev-parse HEAD) to ${{ inputs.branch }}"

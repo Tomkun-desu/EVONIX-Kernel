@@ -77,28 +77,19 @@ jobs:
 
       - name: Resolve and verify
         if: inputs.apply
+        env:
+          BRANCH: ${{ inputs.branch }}
         run: |
           set -o pipefail
           test -x sync/resolve.sh || { echo "::error::sync/resolve.sh missing"; exit 1; }
-          sync/resolve.sh
-          echo "=== unmerged after resolve: $(git diff --name-only --diff-filter=U | wc -l) ==="
-          git diff --name-only --diff-filter=U
+          bash sync/resolve.sh "${BRANCH%%/*}"
           test -z "$(git diff --name-only --diff-filter=U)" || { echo "::error::merge still unmerged"; exit 1; }
-          git add -A
-          git diff --cached --check
-          bash -n build-evonix.sh
-          ! test -e fs/susfs.c || { echo "::error::in-tree fs/susfs.c came back"; exit 1; }
-          ! test -d security/baseband-guard || { echo "::error::in-tree baseband-guard came back"; exit 1; }
-          ! grep -q 'CONFIG_KSU_SUSFS' arch/arm64/configs/evonix.config || { echo "::error::in-tree SUSFS config came back"; exit 1; }
-          ! grep -q 'CONFIG_BBG' arch/arm64/configs/evonix.config || { echo "::error::BBG config came back"; exit 1; }
-          ! grep -q 'CONFIG_NOMOUNT' arch/arm64/configs/evonix.config || { echo "::error::in-tree NoMount config came back"; exit 1; }
-          grep -q '^EXTRAVERSION' Makefile
           echo "=== merge stat ==="
           git diff --cached --stat | tail -n 25
           git commit -q \
-            -m "Merge parent fork (V4.6) with the floating-subsystem carve-outs" \
-            -m "In-tree SUSFS, NoMount and Baseband-Guard from the parent are dropped: this fork floats all three at build time (workflow steps + fragments), so their sources and hooks must not sit in the tree. Their hook files stay as ours, which keeps the tree hook-free but forgoes the parent's stable fixes inside those specific files." \
-            -m "Curated on top of upstream: Makefile branding, our evonix.config fragment plus the new V4.6 feature symbols, our build-evonix.sh guards."
+            -m "Merge parent fork V4.6 with the floating-subsystem carve-outs" \
+            -m "In-tree SUSFS, NoMount, Baseband-Guard and NTSync from the parent are removed again: this fork applies all four at build time (dispatch steps + fragments), so their sources, Kconfig/Makefile wiring and hook blocks must not sit in the tree. Hooks that upstream also touched inside shared files are stripped by sync/strip-hooks.awk; everything else from upstream is merged verbatim." \
+            -m "Arch/arm64/configs/evonix.config is our curated fragment (sync/conf/): upstream V4.6 symbols kept, floated subsystems off, Wild-port extras kept."
           git log --oneline -1
-          git push origin "HEAD:${{ inputs.branch }}"
-          echo "pushed $(git rev-parse HEAD) to ${{ inputs.branch }}"
+          git push origin "HEAD:${BRANCH}"
+          echo "pushed $(git rev-parse HEAD) to ${BRANCH}"

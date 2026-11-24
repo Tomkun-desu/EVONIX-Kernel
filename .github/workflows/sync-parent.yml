@@ -84,7 +84,7 @@ jobs:
           # The resolvers live on the dispatched commit, the merge happens on BRANCH.
           mkdir -p "$RUNNER_TEMP/sync/conf"
           base="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/sync"
-          for f in resolve.sh strip-hooks.awk conf/evonix.hyperos.config conf/evonix.coloros.config; do
+          for f in resolve.sh hookonly.py strip-hooks.awk conf/evonix.hyperos.config conf/evonix.coloros.config; do
             curl -fsSL --retry 3 --retry-all-errors "$base/$f" -o "$RUNNER_TEMP/sync/$f"
           done
           chmod +x "$RUNNER_TEMP/sync/resolve.sh"
@@ -101,3 +101,4 @@ jobs:
           git log --oneline -1
           git push origin "HEAD:${BRANCH}"
           echo "pushed $(git rev-parse HEAD) to ${BRANCH}"
+
